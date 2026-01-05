@@ -1,0 +1,13 @@
+torch
+torchao
+timm
+numpy
+Pillow
+matplotlib
+tqdm
+editdistance
+optuna
+onnxscript
+onnxruntime
+opencv-python
+albumentations
