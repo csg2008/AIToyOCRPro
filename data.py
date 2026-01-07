@@ -1,13 +1,17 @@
+import io
+import os
 import random
 import re
 import string
+from io import BytesIO
 from typing import List
 
+import lmdb
 import numpy as np
 import torch
 from PIL import Image, ImageDraw, ImageFont
-from torch.utils.data import Dataset
-from transforms import rec_train_transform
+from torch.utils.data import Dataset, DataLoader
+from transforms import rec_train_transform, test_transform
 
 # 字符集：数字+大小写字母+特殊字符
 BLANK='<blank>'
@@ -176,56 +180,248 @@ class OCRDataset(Dataset):
             'width': width
         }
 
-def collate_fn(batch):
-    images = [item['image'] for item in batch]
-    texts = [item['text'] for item in batch]
-    text_lengths = [item['text_length'] for item in batch]
-    widths = [item['width'] for item in batch]
+class LmdbDataset(Dataset):
+    '''LMDB格式的文本识别数据集'''
 
-    # ✅ 将宽度向上对齐到 16 的倍数对齐（ViT patch）
-    def round_up_to_patch_size(w, patch_size=16):
-        return ((w + patch_size - 1) // patch_size) * patch_size
+    def __init__(self, data_dir: str, key_img_prefix: str, key_label_prefix: str):
+        self.data_dir = data_dir
+        self.key_img_prefix = key_img_prefix
+        self.key_label_prefix = key_label_prefix
+        self.env = None
+        self.num_samples = 0
+        self.keys = []
+        self._initialize()
 
-    max_width = round_up_to_patch_size(max(widths))
+    def _initialize(self):
+        self.env = lmdb.open(self.data_dir, readonly=True, lock=False, readahead=False)
+        self.num_samples = self._get_num_samples()
+        self.keys = self._get_all_keys()
 
-    bs = len(images)
-    height = images[0].shape[0]
-    images_tensor = torch.ones(bs, 3, height, max_width)
-    patch = []
-    for i, im in enumerate(images):
-        im = rec_train_transform(im)
-        w = im.shape[2]
-        images_tensor[i, :, :, :w] = im
-        patch.append(max(w // 16, 1))                   # patch 长度
-    labels = torch.nn.utils.rnn.pad_sequence(texts, batch_first=True, padding_value=blank_id)
-    label_lens = torch.tensor(text_lengths, dtype=torch.long)
 
-    # 创建有效宽度掩码
-    mask = torch.zeros(len(widths), max_width, dtype=torch.bool)
-    for i, w in enumerate(widths):
-        mask[i, :w] = True
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state['env'] = None
+        return state
 
-    # 处理文字序列（不变）
-    text_lengths = [len(text) for text in texts]
-    max_text_len = max(text_lengths)
-    padded_texts = []
-    for text in texts:
-        padding = max_text_len - len(text)
-        text = torch.cat([torch.tensor([sos_id]), text, torch.tensor([eos_id])])
-        padded = torch.nn.functional.pad(text, (0, padding), value=blank_id)
-        padded_texts.append(padded)
-    texts_tensor = torch.stack(padded_texts)
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._initialize()
 
-    return {
-        'mask': mask,
-        'images': images_tensor,
-        'patch': torch.tensor(patch),
-        'labels': labels,
-        'label_lens': label_lens,
-        'labels_ce': texts_tensor,
-        'text_lengths': torch.tensor(text_lengths),
-        'widths': torch.tensor([max_width] * len(batch))  # 统一宽度
-    }
+    def _get_num_samples(self):
+        with self.env.begin() as txn:
+            length = txn.get(b'num-samples')
+            if length is not None:
+                return int(length)
+            else:
+                return 0
+
+    def _get_all_keys(self):
+        keys = []
+        with self.env.begin() as txn:
+            cursor = txn.cursor()
+            for key, _ in cursor:
+                if key.startswith(self.key_img_prefix.encode()):
+                    keys.append(key)
+        return keys
+
+    def __len__(self):
+        if self.num_samples == 0:
+            return len(self.keys)
+        return self.num_samples
+
+    def __getitem__(self, idx):
+        key_img = f'{self.key_img_prefix}{idx}'.encode()
+        key_label = f'{self.key_label_prefix}{idx}'.encode()
+
+        with self.env.begin() as txn:
+            img_bytes = txn.get(key_img)
+            label_bytes = txn.get(key_label)
+
+            if img_bytes is None or label_bytes is None:
+                if self.keys and idx < len(self.keys):
+                    key = self.keys[idx]
+                    img_bytes = txn.get(key)
+                    label_key = key.replace(self.key_img_prefix.encode(), self.key_label_prefix.encode(), 1)
+                    label_bytes = txn.get(label_key)
+
+                    if img_bytes is None or label_bytes is None:
+                        raise ValueError(f'无法读取样本 {idx}')
+                else:
+                    raise ValueError(f'无法读取样本 {idx}')
+
+            img = Image.open(BytesIO(img_bytes)).convert('RGB')
+            text = label_bytes.decode('utf-8')
+
+        width = img.width
+
+        text_indices = [char2idx[c] for c in text]
+        text_tensor = torch.tensor(text_indices, dtype=torch.long)
+
+        return {
+            'image': np.array(img),
+            'text': text_tensor,
+            'text_length': len(text),
+            'width': width
+        }
+
+def round_up_to_patch_size(w, patch_size=16):
+    return ((w + patch_size - 1) // patch_size) * patch_size
+
+class CollateFnWrapper:
+    """可序列化的collate_fn包装类，解决Windows多进程序列化问题"""
+    def __init__(self, transform_func):
+        self.transform_func = transform_func
+
+    def __call__(self, batch):
+        transform_func = self.transform_func
+        images = [item['image'] for item in batch]
+        texts = [item['text'] for item in batch]
+        text_lengths = [item['text_length'] for item in batch]
+        widths = [item['width'] for item in batch]
+
+        max_width = round_up_to_patch_size(max(widths))
+
+        bs = len(images)
+        height = images[0].shape[0]
+        images_tensor = torch.ones(bs, 3, height, max_width)
+        patch = []
+        for i, im in enumerate(images):
+            im = transform_func(im)
+            w = im.shape[2]
+            images_tensor[i, :, :, :w] = im
+            patch.append(max(w // 16, 1))
+        labels = torch.nn.utils.rnn.pad_sequence(texts, batch_first=True, padding_value=blank_id)
+        label_lens = torch.tensor(text_lengths, dtype=torch.long)
+
+        mask = torch.zeros(len(widths), max_width, dtype=torch.bool)
+        for i, w in enumerate(widths):
+            mask[i, :w] = True
+
+        text_lengths = [len(text) for text in texts]
+        max_text_len = max(text_lengths)
+        padded_texts = []
+        for text in texts:
+            padding = max_text_len - len(text)
+            text = torch.cat([torch.tensor([sos_id]), text, torch.tensor([eos_id])])
+            padded = torch.nn.functional.pad(text, (0, padding), value=blank_id)
+            padded_texts.append(padded)
+        texts_tensor = torch.stack(padded_texts)
+
+        return {
+            'mask': mask,
+            'images': images_tensor,
+            'patch': torch.tensor(patch),
+            'labels': labels,
+            'label_lens': label_lens,
+            'labels_ce': texts_tensor,
+            'text_lengths': torch.tensor(text_lengths),
+            'widths': torch.tensor([max_width] * len(batch))
+        }
+
+def create_dataset(dataset_type: str, data_dir: str,
+                   num_samples: int, img_height: int,
+                   min_width: int, min_chars: int, max_chars: int,
+                   key_img_prefix: str, key_label_prefix: str,
+                   batch_size: int, shuffle: bool,
+                   num_workers: int, pin_memory: bool,
+                   persistent_workers: bool):
+    '''创建DataLoader对象
+
+    Args:
+        dataset_type: 数据集类型，'synthetic' 或 'lmdb'
+        data_dir: LMDB数据目录路径（仅lmdb类型需要）
+        num_samples: 样本数量（仅synthetic类型需要）
+        img_height: 图像高度
+        min_width: 图像最小宽度
+        min_chars: 最少字符数
+        max_chars: 最多字符数
+        key_img_prefix: LMDB图像key前缀
+        key_label_prefix: LMDB标签key前缀
+        batch_size: 批次大小
+        shuffle: 是否打乱数据
+        num_workers: 数据加载进程数
+        pin_memory: 是否使用内存固定
+        persistent_workers: 是否保持worker进程
+
+    Returns:
+        DataLoader对象
+    '''
+    if dataset_type == 'lmdb':
+        if data_dir is None:
+            raise ValueError('LmdbDataset需要指定data_dir参数')
+        dataset = LmdbDataset(data_dir=data_dir,
+                              key_img_prefix=key_img_prefix,
+                              key_label_prefix=key_label_prefix)
+    else:
+        dataset = OCRDataset(num_samples=num_samples,
+                             img_height=img_height,
+                             min_width=min_width,
+                             min_chars=min_chars,
+                             max_chars=max_chars)
+
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle,
+                      num_workers=num_workers, pin_memory=pin_memory,
+                      persistent_workers=persistent_workers,
+                      collate_fn=CollateFnWrapper(test_transform))
+
+def create_dataset_splitted(dataset_type: str, data_dir: str,
+                            num_train: int, num_val: int,
+                            img_height: int, min_width: int,
+                            min_chars: int, max_chars: int,
+                            key_img_prefix: str, key_label_prefix: str,
+                            batch_size: int, num_workers: int,
+                            pin_memory: bool, persistent_workers: bool):
+    '''创建训练和验证DataLoader
+
+    Args:
+        dataset_type: 数据集类型，'synthetic' 或 'lmdb'
+        data_dir: LMDB数据目录路径（仅lmdb类型需要）
+        num_train: 训练样本数
+        num_val: 验证样本数
+        img_height: 图像高度
+        min_width: 图像最小宽度
+        min_chars: 最少字符数
+        max_chars: 最多字符数
+        key_img_prefix: LMDB图像key前缀
+        key_label_prefix: LMDB标签key前缀
+        batch_size: 批次大小
+        num_workers: 数据加载进程数
+        pin_memory: 是否使用内存固定
+        persistent_workers: 是否保持worker进程
+
+    Returns:
+        (train_loader, val_loader) 元组
+    '''
+    from torch.utils.data import random_split
+
+    if dataset_type == 'lmdb':
+        if data_dir is None:
+            raise ValueError('LmdbDataset需要指定data_dir参数')
+        train_set = LmdbDataset(data_dir=os.path.join(data_dir, 'train'),
+                                   key_img_prefix=key_img_prefix,
+                                   key_label_prefix=key_label_prefix)
+        val_set = LmdbDataset(data_dir=os.path.join(data_dir, 'val'),
+                            key_img_prefix=key_img_prefix,
+                            key_label_prefix=key_label_prefix)
+    else:
+        full_dataset = OCRDataset(num_samples=num_train + num_val,
+                                  img_height=img_height,
+                                  min_width=min_width,
+                                  min_chars=min_chars,
+                                  max_chars=max_chars)
+
+        train_set, val_set = random_split(full_dataset, [num_train, num_val])
+
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True,
+                              num_workers=num_workers, pin_memory=pin_memory,
+                              persistent_workers=persistent_workers,
+                              collate_fn=CollateFnWrapper(rec_train_transform))
+    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False,
+                            num_workers=num_workers, pin_memory=pin_memory,
+                            persistent_workers=persistent_workers,
+                            collate_fn=CollateFnWrapper(test_transform))
+
+    return train_loader, val_loader
 
 if __name__ == "__main__":
     full_set = OCRDataset(num_samples=10,
@@ -237,6 +433,7 @@ if __name__ == "__main__":
         full_set[i] for i in range(1)
     ]
 
+    collate_fn = CollateFnWrapper(rec_train_transform)
     batch = collate_fn(data)
     print(batch['labels'].shape, batch['labels'])
     print(batch['labels_ce'].shape, batch['labels_ce'])

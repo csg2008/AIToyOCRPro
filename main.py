@@ -13,12 +13,11 @@ import json
 from pathlib import Path
 from timm.scheduler import create_scheduler_v2
 from torch.amp import GradScaler, autocast
-from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 
 from model import RecNetwork
 from loss import RecognitionLoss
-from data import VOCAB_SIZE, OCRDataset, collate_fn, idx2char, blank_id, sos_id, eos_id, VOCAB, OTHER_PAD_SIZE, CONFUSE_WEIGHT_OPTIMIZED
+from data import VOCAB_SIZE, idx2char, blank_id, sos_id, eos_id, VOCAB, OTHER_PAD_SIZE, CONFUSE_WEIGHT_OPTIMIZED, create_dataset, create_dataset_splitted
 from debug import debug_virtual_alignment
 from deployment import create_deployment_package, ctc_decode_v2, cer_score, exact_match
 from quantization import (
@@ -57,7 +56,7 @@ def parse_args():
     parser.add_argument('--in_channels', type=int, default=3, help='输入通道数')
     parser.add_argument('--max_text_length', type=int, default=70, help='最大文本长度')
     parser.add_argument('--dropout', type=float, default=0.05, help='dropout比例')
-    parser.add_argument('--num_workers', type=int, default=8, help='数据集加载进程数')
+    parser.add_argument('--num_workers', type=int, default=0, help='数据集加载进程数')
     parser.add_argument('--warmup_lr', type=int, default=3, help='前 N 轮线性增大学习率')
     parser.add_argument('--warmup_decoder', type=int, default=10, help='前 N 轮不开启蒸馏')
 
@@ -69,6 +68,10 @@ def parse_args():
     parser.add_argument('--img_export_width', type=int, default=512, help='图像最小宽度')
     parser.add_argument('--min_chars', type=int, default=15, help='最少字符数')
     parser.add_argument('--max_chars', type=int, default=50, help='最多字符数')
+    parser.add_argument('--dataset_type', type=str, choices=['synthetic', 'lmdb'], default='synthetic', help='数据集类型')
+    parser.add_argument('--lmdb_data_dir', type=str, default=None, help='LMDB数据集目录路径')
+    parser.add_argument('--key_img_prefix', type=str, default='img-', help='LMDB图像key前缀')
+    parser.add_argument('--key_label_prefix', type=str, default='label-', help='LMDB标签key前缀')
 
     # 模型保存配置
     parser.add_argument('--checkpoint', type=str, default='ocr_latest.pth', help='断点文件路径')
@@ -393,19 +396,23 @@ def train_quantized_main(args, quantization_manager: QuantizationManager, quanti
     if quantization_config is None:
         quantization_config = QUANTIZATION_CONFIG
 
-    # 1. 数据集拆分
-    full_set = OCRDataset(num_samples=args.num_train + args.num_val,
-                        img_height=args.img_height,
-                        min_width=args.img_min_width,
-                        min_chars=args.min_chars,
-                        max_chars=args.max_chars)
-    train_set, val_set = random_split(full_set, [args.num_train, args.num_val])
-    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True,
-                              num_workers=args.num_workers, pin_memory=True if device == 'cuda' else False,
-                              persistent_workers=args.num_workers > 0, collate_fn=collate_fn)
-    val_loader   = DataLoader(val_set,   batch_size=args.batch_size, shuffle=False,
-                              num_workers=args.num_workers, pin_memory=True if device == 'cuda' else False,
-                              persistent_workers=args.num_workers > 0, collate_fn=collate_fn)
+    # 1. 创建DataLoader
+    train_loader, val_loader = create_dataset_splitted(
+        dataset_type=args.dataset_type,
+        data_dir=args.lmdb_data_dir,
+        num_train=args.num_train,
+        num_val=args.num_val,
+        img_height=args.img_height,
+        min_width=args.img_min_width,
+        min_chars=args.min_chars,
+        max_chars=args.max_chars,
+        key_img_prefix=args.key_img_prefix,
+        key_label_prefix=args.key_label_prefix,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        pin_memory=True if device == 'cuda' else False,
+        persistent_workers=True if device == 'cuda' else False,
+    )
 
     # 基础损失函数
     criterion = RecognitionLoss(
@@ -709,23 +716,22 @@ def evaluate_quantization(original_model: nn.Module, quantized_model: nn.Module,
     print(f"   - 图像尺寸: {args.img_height}x{args.img_min_width}")
     print(f"   - 字符范围: {args.min_chars}-{args.max_chars}")
 
-    # 创建评估数据集
-    val_dataset = OCRDataset(
+    # 创建评估DataLoader
+    val_loader = create_dataset(
+        dataset_type=args.dataset_type,
+        data_dir=args.lmdb_data_dir,
         num_samples=args.num_val,
         img_height=args.img_height,
         min_width=args.img_min_width,
         min_chars=args.min_chars,
-        max_chars=args.max_chars
-    )
-
-    # 创建数据加载器 - 与训练保持一致的配置
-    val_loader = DataLoader(
-        val_dataset,
+        max_chars=args.max_chars,
+        key_img_prefix=args.key_img_prefix,
+        key_label_prefix=args.key_label_prefix,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
-        pin_memory=True,
-        collate_fn=collate_fn
+        pin_memory=True if device == 'cuda' else False,
+        persistent_workers=True if device == 'cuda' else False,
     )
 
     # 运行评估
@@ -886,6 +892,11 @@ def main():
     pruning_manager = PruningManager(pruning_config, model)
     print("🌱 剪枝配置创建完成")
 
+    # 如果进程数量为零且是CUDA训练，将进程数量设置为CPU核心数
+    if args.num_workers == 0 and device == 'cuda':
+        args.num_workers = os.cpu_count()
+        print(f"⚠️  未指定进程数，自动设置为CPU核心数: {args.num_workers}")
+
     # 训练模式
     if args.mode in ['train', 'both']:
         # 调用主要的训练函数
@@ -948,29 +959,30 @@ def main():
 
     # 创建部署
     if args.mode == 'optimization_study':
-        # 创建数据集和加载器
+        # 创建DataLoader
         print("📊 准备优化数据集...")
-        val_dataset = OCRDataset(
+        val_loader = create_dataset(
+            dataset_type=args.dataset_type,
+            data_dir=args.lmdb_data_dir,
             num_samples=args.num_val,
             img_height=args.img_height,
             min_width=args.img_min_width,
             min_chars=args.min_chars,
-            max_chars=args.max_chars
-        )
-
-        dataloader = DataLoader(
-            val_dataset,
+            max_chars=args.max_chars,
+            key_img_prefix=args.key_img_prefix,
+            key_label_prefix=args.key_label_prefix,
             batch_size=args.batch_size,
             shuffle=False,
-            num_workers=0,  # 使用单进程加载数据，避免多进程问题
-            collate_fn=collate_fn
+            num_workers=0,
+            pin_memory=True if device == 'cuda' else False,
+            persistent_workers=True if device == 'cuda' else False,
         )
 
         # 运行优化研究
         create_optimization_study(
             device=device,
             model=model,
-            dataloader=dataloader,
+            dataloader=val_loader,
             output_dir=output_dir,
             study_name=args.study_name,
             method=args.method,

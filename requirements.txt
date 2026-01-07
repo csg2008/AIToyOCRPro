@@ -5,6 +5,7 @@ numpy
 Pillow
 matplotlib
 tqdm
+lmdb
 editdistance
 optuna
 onnxscript
