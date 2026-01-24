@@ -462,8 +462,8 @@ det_ft_transform = TransformWrapper(alb.Compose(
 test_transform = TransformWrapper(alb.Compose(
     [
         # 基础预处理：灰度化 + 归一化
-        alb.ToGray(num_output_channels=1, method="weighted_average", p=1.0),  # 转换为灰度图
-        alb.Normalize(mean=0.0, std=1.0, max_pixel_value=255.0, p=1.0),  # 归一化到0-1范围
-        # alb.Normalize(0.456045, 0.224567),  # 可选的标准化
+        # alb.ToGray(num_output_channels=1, method="weighted_average", p=1.0),  # 转换为灰度图
+        # alb.Normalize(mean=0.0, std=1.0, max_pixel_value=255.0, p=1.0),  # 归一化到0-1范围
+        alb.Normalize(0.456045, 0.224567),  # 可选的标准化
     ]
 ))
