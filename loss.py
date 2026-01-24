@@ -27,7 +27,7 @@ class EnhancedCTCLoss(nn.Module):
                  eos_penalty_decay: float = 0.9,       # 尾部惩罚衰减系数
                  eos_window_size: int = 3,             # 尾部窗口大小
                  eos_adaptive: bool = True,            # 是否使用自适应尾部惩罚
-                 char_focal: bool = False,             # 是否启用字符级Focal Loss
+                 char_focal: int = 1,                  # Focal Loss类型：0-不启用，1-字符级，2-样本级
                  focal_gamma: float = 2.0,             # Focal Loss gamma参数
                  focal_scale: float = 1.0,             # Focal Loss缩放因子
                  adaptive_margin: bool = False,        # 是否启用自适应Margin
@@ -122,7 +122,7 @@ class EnhancedCTCLoss(nn.Module):
             应用focal权重后的损失
         """
         # 提前返回条件 - 避免不必要的计算
-        if not self.char_focal or self.focal_gamma == 0 or self.focal_scale_buffer.item() == 0:
+        if self.char_focal != 1 or self.focal_gamma == 0 or self.focal_scale_buffer.item() == 0:
             return raw_loss
 
         # 计算字符级focal权重
@@ -329,12 +329,12 @@ class EnhancedCTCLoss(nn.Module):
 
         # 应用字符级Focal Loss - 聚焦最难识别的字符
         char_focal_losses = ctc_losses.clone()
-        if training and self.char_focal and self.focal_gamma != 0 and self.focal_scale_buffer.item() != 0:
+        if training and self.char_focal == 1 and self.focal_gamma != 0 and self.focal_scale_buffer.item() != 0:
             char_focal_losses = self._apply_char_focal(log_probs, input_lengths, targets, target_lengths, ctc_losses)
 
         # 应用样本级Focal Loss - 聚焦困难样本
         sample_focal_losses = char_focal_losses.clone()
-        if training and self.focal_gamma != 0 and self.focal_scale_buffer.item() != 0:
+        if training and self.char_focal == 2 and self.focal_gamma != 0 and self.focal_scale_buffer.item() != 0:
             # 使用更稳定的数值计算
             pt = (-char_focal_losses.clamp(max=10.0)).exp()  # 限制最大值避免数值溢出
             focal_weights = (1 - pt.clamp(min=1e-7, max=1-1e-7)) ** (self.focal_gamma * self.focal_scale_buffer.item())
@@ -425,8 +425,8 @@ class EnhancedCTCLoss(nn.Module):
             current_margin = self.margin_delta.sigmoid().item() * self.margin_max
             loss_components['adaptive_margin'] = current_margin
 
-        # 如果启用了温度退火或字符级Focal Loss，添加focal缩放因子
-        if self.temperature_annealing or self.char_focal:
+        # 如果启用了温度退火或Focal Loss（字符级或样本级），添加focal缩放因子
+        if self.temperature_annealing or self.char_focal != 0:
             loss_components['focal_scale'] = self.focal_scale_buffer.item()
 
         return loss_components
