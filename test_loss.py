@@ -6,6 +6,15 @@ import torch
 from loss import EnhancedCTCLoss, DistillationLoss
 from data import char2idx, CONFUSE_WEIGHT_OPTIMIZED
 
+
+def convert_confuse_weight_dict(confuse_weight_dict_str: dict) -> dict:
+    """将字符为键的混淆权重字典转换为索引为键的字典"""
+    return {char2idx[char]: weight for char, weight in confuse_weight_dict_str.items() if char in char2idx}
+
+
+# 预转换混淆权重字典为索引格式
+CONFUSE_WEIGHT_BY_IDX = convert_confuse_weight_dict(CONFUSE_WEIGHT_OPTIMIZED)
+
 def test_basic_functionality():
     """测试基本功能"""
     print("=== 测试基本功能 ===")
@@ -18,7 +27,7 @@ def test_basic_functionality():
     target_lens = torch.tensor([3, 3], dtype=torch.long)
 
     # 测试增强CTC损失函数
-    loss_fn = EnhancedCTCLoss(vocab_size=V, blank=0, confuse_weight_dict=CONFUSE_WEIGHT_OPTIMIZED)
+    loss_fn = EnhancedCTCLoss(vocab_size=V, blank=0, confuse_weight_dict=CONFUSE_WEIGHT_BY_IDX)
 
     try:
         loss = loss_fn(logits, targets, input_lens, target_lens)
@@ -60,15 +69,15 @@ def test_backward_compatibility():
 
     try:
         # 测试基础CTC功能
-        basic_loss_fn = EnhancedCTCLoss(vocab_size=V, blank=0, confuse_weight_dict=CONFUSE_WEIGHT_OPTIMIZED)
+        basic_loss_fn = EnhancedCTCLoss(vocab_size=V, blank=0, confuse_weight_dict=CONFUSE_WEIGHT_BY_IDX)
         basic_loss = basic_loss_fn(logits.clone(), targets, input_lens, target_lens)
 
         # 测试带形近字权重的功能
-        weighted_loss_fn = EnhancedCTCLoss(vocab_size=V, blank=0, confuse_weight_dict=CONFUSE_WEIGHT_OPTIMIZED, confuse_gamma=1.0)
+        weighted_loss_fn = EnhancedCTCLoss(vocab_size=V, blank=0, confuse_weight_dict=CONFUSE_WEIGHT_BY_IDX, confuse_gamma=1.0)
         weighted_loss = weighted_loss_fn(logits.clone(), targets, input_lens, target_lens)
 
         # 测试带EOS惩罚的功能
-        eos_loss_fn = EnhancedCTCLoss(vocab_size=V, blank=0, confuse_weight_dict=CONFUSE_WEIGHT_OPTIMIZED, eos_penalty=0.1)
+        eos_loss_fn = EnhancedCTCLoss(vocab_size=V, blank=0, confuse_weight_dict=CONFUSE_WEIGHT_BY_IDX, eos_penalty=0.1)
         eos_loss = eos_loss_fn(logits.clone(), targets, input_lens, target_lens)
 
         print(f"✓ 基础CTC损失: {basic_loss.item():.6f}")
@@ -106,7 +115,7 @@ def test_confuse_characters():
 
     # 测试不同gamma值的影响
     for gamma in [0.5, 1.0, 2.0]:
-        loss_fn = EnhancedCTCLoss(vocab_size=V, blank=0, confuse_weight_dict=CONFUSE_WEIGHT_OPTIMIZED, confuse_gamma=gamma)
+        loss_fn = EnhancedCTCLoss(vocab_size=V, blank=0, confuse_weight_dict=CONFUSE_WEIGHT_BY_IDX, confuse_gamma=gamma)
         loss = loss_fn(logits.clone(), targets, input_lens, target_lens)
 
         components = loss_fn.get_loss_components(logits.clone(), targets, input_lens, target_lens)
@@ -131,7 +140,7 @@ def test_eos_penalty():
 
     # 测试不同惩罚系数的影响
     for penalty in [0.0, 0.1, 0.5, 1.0]:
-        loss_fn = EnhancedCTCLoss(vocab_size=V, blank=0, confuse_weight_dict=CONFUSE_WEIGHT_OPTIMIZED, eos_penalty=penalty)
+        loss_fn = EnhancedCTCLoss(vocab_size=V, blank=0, confuse_weight_dict=CONFUSE_WEIGHT_BY_IDX, eos_penalty=penalty)
         loss = loss_fn(logits.clone(), targets, input_lens, target_lens)
 
         components = loss_fn.get_loss_components(logits.clone(), targets, input_lens, target_lens)
@@ -152,7 +161,7 @@ def test_gradient_stability():
     input_lens = torch.tensor([10, 8], dtype=torch.long)
     target_lens = torch.tensor([3, 3], dtype=torch.long)
 
-    loss_fn = EnhancedCTCLoss(vocab_size=V, blank=0, confuse_weight_dict=CONFUSE_WEIGHT_OPTIMIZED, gradient_clip=True)
+    loss_fn = EnhancedCTCLoss(vocab_size=V, blank=0, confuse_weight_dict=CONFUSE_WEIGHT_BY_IDX, gradient_clip=True)
 
     try:
         loss = loss_fn(logits, targets, input_lens, target_lens)
@@ -189,7 +198,7 @@ def test_performance_comparison():
     import time
 
     # 测试基础实现
-    basic_loss = EnhancedCTCLoss(vocab_size=V, blank=0, confuse_weight_dict=CONFUSE_WEIGHT_OPTIMIZED)
+    basic_loss = EnhancedCTCLoss(vocab_size=V, blank=0, confuse_weight_dict=CONFUSE_WEIGHT_BY_IDX)
 
     start_time = time.time()
     for _ in range(10):
@@ -199,7 +208,7 @@ def test_performance_comparison():
     # 测试增强实现（带新优化）
     enhanced_loss = EnhancedCTCLoss(
         vocab_size=V, blank=0,
-        confuse_weight_dict=CONFUSE_WEIGHT_OPTIMIZED,
+        confuse_weight_dict=CONFUSE_WEIGHT_BY_IDX,
         char_focal=1,  # 1-字符级Focal Loss
         focal_gamma=2.0,
         adaptive_margin=True,
@@ -266,7 +275,7 @@ def test_char_focal_loss():
         for gamma in [1.0, 2.0, 3.0]:
             loss_fn = EnhancedCTCLoss(
                 vocab_size=V, blank=0,
-                confuse_weight_dict=CONFUSE_WEIGHT_OPTIMIZED,
+                confuse_weight_dict=CONFUSE_WEIGHT_BY_IDX,
                 char_focal=char_focal,
                 focal_gamma=gamma,
                 focal_scale=1.0
@@ -300,7 +309,7 @@ def test_adaptive_margin():
     ]
 
     for config in test_configs:
-        loss_fn = EnhancedCTCLoss(vocab_size=V, blank=0, confuse_weight_dict=CONFUSE_WEIGHT_OPTIMIZED, **config)
+        loss_fn = EnhancedCTCLoss(vocab_size=V, blank=0, confuse_weight_dict=CONFUSE_WEIGHT_BY_IDX, **config)
         loss = loss_fn(logits.clone(), targets, input_lens, target_lens)
 
         components = loss_fn.get_loss_components(logits.clone(), targets, input_lens, target_lens)
@@ -323,7 +332,7 @@ def test_temperature_annealing():
 
     loss_fn = EnhancedCTCLoss(
         vocab_size=V, blank=0,
-        confuse_weight_dict=CONFUSE_WEIGHT_OPTIMIZED,
+        confuse_weight_dict=CONFUSE_WEIGHT_BY_IDX,
         temperature_annealing=True,
         char_focal=1,  # 1-字符级Focal Loss
         focal_gamma=2.0
@@ -366,7 +375,7 @@ def test_combined_optimizations():
     # 基准配置 - 只使用基础优化
     baseline_loss_fn = EnhancedCTCLoss(
         vocab_size=V, blank=0,
-        confuse_weight_dict=CONFUSE_WEIGHT_OPTIMIZED,
+        confuse_weight_dict=CONFUSE_WEIGHT_BY_IDX,
         confuse_gamma=1.0,
         eos_penalty=0.1
     )
@@ -381,7 +390,7 @@ def test_combined_optimizations():
     # 完整优化配置 - 启用所有新功能
     full_optimization_loss_fn = EnhancedCTCLoss(
         vocab_size=V, blank=0,
-        confuse_weight_dict=CONFUSE_WEIGHT_OPTIMIZED,
+        confuse_weight_dict=CONFUSE_WEIGHT_BY_IDX,
         confuse_gamma=1.2,
         eos_penalty=0.15,
         char_focal=1,  # 1-字符级Focal Loss
@@ -431,7 +440,7 @@ def test_temperature_parameter_effects():
     for temperature in [0.5, 1.0, 2.0, 5.0]:
         loss_fn = EnhancedCTCLoss(
             vocab_size=V, blank=0,
-            confuse_weight_dict=CONFUSE_WEIGHT_OPTIMIZED,
+            confuse_weight_dict=CONFUSE_WEIGHT_BY_IDX,
             confuse_gamma=base_gamma,
             confuse_temperature=temperature
         )
@@ -470,7 +479,7 @@ def test_adaptive_eos_window():
         # 固定窗口
         fixed_loss_fn = EnhancedCTCLoss(
             vocab_size=V, blank=0,
-            confuse_weight_dict=CONFUSE_WEIGHT_OPTIMIZED,
+            confuse_weight_dict=CONFUSE_WEIGHT_BY_IDX,
             eos_penalty=0.1,
             eos_window_size=window_size,
             eos_adaptive=False
@@ -481,7 +490,7 @@ def test_adaptive_eos_window():
         # 自适应窗口
         adaptive_loss_fn = EnhancedCTCLoss(
             vocab_size=V, blank=0,
-            confuse_weight_dict=CONFUSE_WEIGHT_OPTIMIZED,
+            confuse_weight_dict=CONFUSE_WEIGHT_BY_IDX,
             eos_penalty=0.1,
             eos_window_size=window_size,
             eos_adaptive=True
@@ -516,7 +525,7 @@ def test_gradient_clip_thresholds():
     ]
 
     for config in clip_configs:
-        loss_fn = EnhancedCTCLoss(vocab_size=V, blank=0, confuse_weight_dict=CONFUSE_WEIGHT_OPTIMIZED, **config)
+        loss_fn = EnhancedCTCLoss(vocab_size=V, blank=0, confuse_weight_dict=CONFUSE_WEIGHT_BY_IDX, **config)
 
         try:
             loss = loss_fn(logits.clone(), targets, input_lens, target_lens)
@@ -555,7 +564,7 @@ def test_different_reduction_modes():
     reduction_modes = ['mean', 'sum']
 
     for reduction in reduction_modes:
-        loss_fn = EnhancedCTCLoss(vocab_size=V, blank=0, confuse_weight_dict=CONFUSE_WEIGHT_OPTIMIZED, reduction=reduction)
+        loss_fn = EnhancedCTCLoss(vocab_size=V, blank=0, confuse_weight_dict=CONFUSE_WEIGHT_BY_IDX, reduction=reduction)
         loss = loss_fn(logits.clone(), targets, input_lens, target_lens)
 
         # 获取组件分解
@@ -617,7 +626,7 @@ def test_numerical_stability_boundaries():
 
         loss_fn = EnhancedCTCLoss(
             vocab_size=V, blank=0,
-            confuse_weight_dict=CONFUSE_WEIGHT_OPTIMIZED,
+            confuse_weight_dict=CONFUSE_WEIGHT_BY_IDX,
             gradient_clip=True  # 启用梯度裁剪防止数值问题
         )
 

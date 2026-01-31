@@ -3,7 +3,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Optional
-from data import idx2char
 
 class EnhancedCTCLoss(nn.Module):
     """
@@ -20,7 +19,7 @@ class EnhancedCTCLoss(nn.Module):
     def __init__(self,
                  vocab_size: int,
                  blank: int,
-                 confuse_weight_dict: Optional[Dict[str, float]],
+                 confuse_weight_dict: Optional[Dict[int, float]],
                  confuse_gamma: float = 1.0,           # 形近字权重缩放因子
                  confuse_temperature: float = 1.0,     # 形近字温度参数
                  eos_penalty: float = 0.1,             # 尾部空白惩罚系数
@@ -98,8 +97,7 @@ class EnhancedCTCLoss(nn.Module):
         char_weights_array = torch.ones(vocab_size)
 
         for idx in range(vocab_size):
-            char = idx2char.get(idx, '')
-            weight = self.confuse_weight_dict.get(char, 1.0)
+            weight = self.confuse_weight_dict.get(idx, 1.0)
             # 应用gamma缩放和温度参数
             char_weights_array[idx] = (weight ** self.confuse_gamma) ** (1.0 / self.confuse_temperature)
 

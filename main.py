@@ -17,7 +17,7 @@ from tqdm import tqdm
 
 from model import RecNetwork
 from loss import RecognitionLoss
-from data import VOCAB_SIZE, idx2char, blank_id, sos_id, eos_id, VOCAB, OTHER_PAD_SIZE, CONFUSE_WEIGHT_OPTIMIZED, create_dataset, create_dataset_splitted
+from data import VOCAB_SIZE, idx2char, char2idx, blank_id, sos_id, eos_id, VOCAB, OTHER_PAD_SIZE, CONFUSE_WEIGHT_OPTIMIZED, create_dataset, create_dataset_splitted
 from debug import debug_virtual_alignment
 from deployment import create_deployment_package, ctc_decode_v2, cer_score, exact_match
 from quantization import (
@@ -380,7 +380,7 @@ def prepare_model(args, device: str, checkpoint) -> RecNetwork:
 
     return model, ckpt
 
-def train_quantized_main(args, quantization_manager: QuantizationManager, quantization_config: Dict, model: nn.Module, ckpt, device: str, output_dir: str, pruning_manager: PruningManager, confuse_weight_dict: Optional[Dict[str, float]]):
+def train_quantized_main(args, quantization_manager: QuantizationManager, quantization_config: Dict, model: nn.Module, ckpt, device: str, output_dir: str, pruning_manager: PruningManager, confuse_weight_dict: Optional[Dict[int, float]]):
     # 检查显卡是否支持bf16数据类型
     use_bf16 = False
     if torch.cuda.is_available():
@@ -918,6 +918,8 @@ def main():
     if args.mode in ['train', 'both']:
         # 调用主要的训练函数
         print("🎯 开始量化训练...")
+        # 将字符为键的混淆权重字典转换为索引为键的字典
+        confuse_weight_dict_idx = {char2idx[char]: weight for char, weight in CONFUSE_WEIGHT_OPTIMIZED.items() if char in char2idx}
         quantized_model, success = train_quantized_main(
             args=args,
             quantization_manager=quantization_manager,
@@ -926,7 +928,7 @@ def main():
             ckpt=ckpt,
             device=device,
             output_dir=output_dir,
-            confuse_weight_dict=CONFUSE_WEIGHT_OPTIMIZED,
+            confuse_weight_dict=confuse_weight_dict_idx,
             pruning_manager=pruning_manager
         )
 
