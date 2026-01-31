@@ -81,6 +81,8 @@ def parse_args():
     # 量化配置
     parser.add_argument('--enable_quantization', action='store_true', default=False,
                        help='启用量化训练')
+    parser.add_argument('--quantization_mode', type=str, choices=['qat', 'ptq', 'both'], default='qat',
+                       help='量化模式: qat 量化感知训练, ptq 训练后量化, both 两者都启用')
     parser.add_argument('--quantization_strategy', type=str,
                        choices=['int8_dyn_act_int4_weight', 'int8_weight_only',
                                'int4_weight_only', 'int8_dynamic_activation_int8_weight'],
@@ -416,6 +418,7 @@ def train_quantized_main(args, quantization_manager: QuantizationManager, quanti
 
     # 基础损失函数
     criterion = RecognitionLoss(
+        max_epoch=args.epochs,
         vocab_size=VOCAB_SIZE,
         ignore_index=blank_id,
         ctc_weight=2.0,
@@ -570,16 +573,22 @@ def train_quantized_main(args, quantization_manager: QuantizationManager, quanti
                 print('🎉  Val_EM 达到 99.2 %，训练提前完成')
                 break
 
-            # 检查是否需要剪枝
+            # 检查是否需要记录剪枝候选节点
             if pruning_manager.is_pruning_time(epoch):
-                # 应用剪枝
-                pruning_manager.apply_pruning(epoch, val_em, best_em)
+                # 记录剪枝候选节点（部署时应用）
+                pruning_manager.record_pruning_candidates(epoch, val_em, best_em)
 
     except Exception as e:
         print(f'❌ 训练过程中出现异常: {e}')
         success = False
 
     print('\n训练结束（可能提前停止）')
+
+    # 保存剪枝候选信息（如果有）
+    if pruning_manager.pruning_candidates:
+        candidates_path = f'{output_dir}/models/pruning_candidates.json'
+        pruning_manager.save_pruning_candidates(candidates_path)
+
     return model, success
 
 def setup_device(device: str) -> str:
@@ -679,8 +688,16 @@ def prepare_quantized_manage(args, config: QuantizationConfig, model: nn.Module,
 
     # 将QuantizationConfig转换为字典
     quantization_config = config.to_dict()
-    quantization_config['quantization_aware_training'] = True
-    quantization_config['post_training_quantization'] = False
+    # 根据命令行参数设置量化模式
+    if args.quantization_mode == 'qat':
+        quantization_config['quantization_aware_training'] = True
+        quantization_config['post_training_quantization'] = False
+    elif args.quantization_mode == 'ptq':
+        quantization_config['quantization_aware_training'] = False
+        quantization_config['post_training_quantization'] = True
+    else:  # both
+        quantization_config['quantization_aware_training'] = True
+        quantization_config['post_training_quantization'] = True
     quantization_config['quantization_strategy'] = args.quantization_strategy
     quantization_config['weight_bits'] = args.weight_bits
     quantization_config['activation_bits'] = args.activation_bits
@@ -937,19 +954,27 @@ def main():
 
     # 创建部署
     if success and args.mode in ['deployment', 'both']:
-        if args.enable_pruning and ckpt['pruning']:
-            # 永久化剪枝
-            pruning_manager.apply_pruning(ckpt['epoch'], 0, ckpt['best_em'])
-            pruning_manager.remove_pruning()
+        if args.enable_pruning:
+            # 检查是否有剪枝候选信息文件
+            candidates_path = f'{output_dir}/models/pruning_candidates.json'
+            if os.path.exists(candidates_path):
+                # 加载剪枝候选信息
+                pruning_manager.load_pruning_candidates(candidates_path)
 
-            # 打印剪枝信息
-            if pruning_manager.pruning_applied:
-                prune_info = pruning_manager.get_pruned_model_info()
-                print(f"\n🌳 剪枝总结:")
-                print(f"   - 剪枝应用: {'是' if prune_info['pruning_applied'] else '否'}")
-                print(f"   - 剪枝层数量: {prune_info['pruned_layers_count']}")
-                print(f"   - 实际剪枝比例: {prune_info['pruning_ratio']:.2%}")
-                print(f"   - 剪枝层: {prune_info['pruned_layers'][:5]}..." if len(prune_info['pruned_layers']) > 5 else f"   - 剪枝层: {prune_info['pruned_layers']}")
+                # 应用剪枝
+                pruning_manager.apply_pruning_from_candidates()
+                pruning_manager.remove_pruning()
+
+                # 打印剪枝信息
+                if pruning_manager.pruning_applied:
+                    prune_info = pruning_manager.get_pruned_model_info()
+                    print(f"\n🌳 剪枝总结:")
+                    print(f"   - 剪枝应用: {'是' if prune_info['pruning_applied'] else '否'}")
+                    print(f"   - 剪枝层数量: {prune_info['pruned_layers_count']}")
+                    print(f"   - 实际剪枝比例: {prune_info['pruning_ratio']:.2%}")
+                    print(f"   - 剪枝层: {prune_info['pruned_layers'][:5]}..." if len(prune_info['pruned_layers']) > 5 else f"   - 剪枝层: {prune_info['pruned_layers']}")
+            else:
+                print(f"⚠️  未找到剪枝候选信息文件: {candidates_path}")
 
         dummy_input = torch.randn(3, 3, args.img_height, args.img_export_width)
         create_deployment_package(quantized_model, quantization_config, args.deployment_target, output_dir, dummy_input,

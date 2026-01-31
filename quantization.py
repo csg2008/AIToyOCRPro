@@ -88,6 +88,7 @@ class PruningManager:
         self.pruned_layers = []
         self.original_model = None
         self.pruning_applied = False
+        self.pruning_candidates = {}
 
     def get_pruning_ratio(self, layer_name: str) -> float:
         """获取特定层的剪枝比例"""
@@ -95,6 +96,91 @@ class PruningManager:
             if layer_type in layer_name:
                 return ratio
         return self.config.pruning_ratio
+
+    def record_pruning_candidates(self, epoch: int, current_acc: float, best_acc: float) -> bool:
+        """记录剪枝候选节点"""
+        if not self.config.enabled:
+            return False
+
+        # 检查是否达到剪枝条件
+        if epoch != self.config.pruning_epoch:
+            return False
+
+        # 检查精度是否足够高
+        if current_acc < best_acc * 0.95:
+            return False
+
+        print(f"🎯 开始记录剪枝候选节点...")
+        print(f"   - 当前精度: {current_acc:.4f}")
+        print(f"   - 最佳精度: {best_acc:.4f}")
+        print(f"   - 剪枝策略: {self.config.pruning_strategy}")
+
+        # 遍历模型的所有层
+        for name, module in self.model.named_modules():
+            # 只考虑卷积层和全连接层
+            if isinstance(module, (nn.Conv2d, nn.Linear)):
+                # 检查是否在指定的剪枝层中
+                if any(layer_type in name for layer_type in self.config.pruning_layers):
+                    pruning_ratio = self.get_pruning_ratio(name)
+                    print(f"   - 记录层: {name}, 剪枝比例: {pruning_ratio:.2f}")
+
+                    # 获取权重
+                    weight = module.weight.data.cpu()
+
+                    # 根据剪枝标准计算权重重要性
+                    if self.config.prune_criteria == 'l1':
+                        # L1范数
+                        importance = torch.abs(weight)
+                    elif self.config.prune_criteria == 'l2':
+                        # L2范数
+                        importance = torch.norm(weight, dim=-1)
+                    elif self.config.prune_criteria == 'grad':
+                        # 梯度信息（如果可用）
+                        if module.weight.grad is not None:
+                            importance = torch.abs(module.weight.grad.data.cpu())
+                        else:
+                            importance = torch.abs(weight)
+                    else:
+                        # 默认使用L1范数
+                        importance = torch.abs(weight)
+
+                    # 根据剪枝策略确定剪枝方式
+                    if self.config.pruning_strategy == 'l1_unstructured':
+                        # 非结构化剪枝：按权重值排序
+                        flat_importance = importance.flatten()
+                        threshold = torch.quantile(flat_importance, pruning_ratio)
+                        mask = importance > threshold
+                    else:
+                        # 结构化剪枝：按通道或神经元排序
+                        if isinstance(module, nn.Conv2d):
+                            # 卷积层按输出通道排序
+                            channel_importance = importance.view(importance.size(0), -1).mean(dim=1)
+                        else:
+                            # 全连接层按输出神经元排序
+                            channel_importance = importance.view(importance.size(0), -1).mean(dim=1)
+
+                        num_channels = len(channel_importance)
+                        num_prune = int(num_channels * pruning_ratio)
+                        sorted_indices = torch.argsort(channel_importance)
+                        prune_indices = sorted_indices[:num_prune]
+
+                        # 创建掩码
+                        mask = torch.ones_like(weight)
+                        if isinstance(module, nn.Conv2d):
+                            mask[prune_indices, :, :, :] = 0
+                        else:
+                            mask[prune_indices, :] = 0
+
+                    # 存储剪枝候选信息
+                    self.pruning_candidates[name] = {
+                        'module_type': module.__class__.__name__,
+                        'pruning_ratio': pruning_ratio,
+                        'mask': mask,
+                        'importance': importance
+                    }
+
+        print(f"✅ 剪枝候选节点记录完成")
+        return True
 
     def apply_pruning(self, epoch: int, current_acc: float, best_acc: float) -> bool:
         """应用剪枝"""
@@ -174,6 +260,52 @@ class PruningManager:
                     prune.ln_structured(module, name='weight', amount=pruning_ratio, **self.config.prune_params)
                     self.pruned_layers.append((name, module))
 
+    def apply_pruning_from_candidates(self) -> bool:
+        """从记录的候选节点应用剪枝"""
+        if not self.config.enabled or not self.pruning_candidates:
+            return False
+
+        print(f"🎯 开始从候选节点应用剪枝...")
+        print(f"   - 剪枝候选节点数量: {len(self.pruning_candidates)}")
+
+        # 保存原始模型
+        self.original_model = self.model.state_dict()
+
+        # 遍历候选节点并应用剪枝
+        for name, info in self.pruning_candidates.items():
+            # 查找对应模块
+            module = self._get_module_by_name(name)
+            if module is None:
+                print(f"⚠️  未找到模块: {name}")
+                continue
+
+            print(f"   - 应用剪枝到层: {name}, 剪枝比例: {info['pruning_ratio']:.2f}")
+
+            # 获取掩码
+            mask = info['mask'].to(module.weight.device)
+
+            # 应用掩码到权重
+            with torch.no_grad():
+                module.weight.data *= mask
+
+            # 记录剪枝后的层
+            self.pruned_layers.append((name, module))
+
+        self.pruning_applied = True
+        print(f"✅ 剪枝应用完成")
+        return True
+
+    def _get_module_by_name(self, name: str):
+        """根据名称获取模块"""
+        parts = name.split('.')
+        module = self.model
+        for part in parts:
+            if part in module._modules:
+                module = module._modules[part]
+            else:
+                return None
+        return module
+
     def remove_pruning(self):
         """移除剪枝包装，使剪枝永久化"""
         if not self.pruning_applied:
@@ -226,6 +358,70 @@ class PruningManager:
             'pruned_layers': [name for name, _ in self.pruned_layers]
         }
         return info
+
+    def save_pruning_candidates(self, path: str):
+        """保存剪枝候选信息到文件"""
+        if not self.pruning_candidates:
+            print(f"⚠️  没有剪枝候选信息可保存")
+            return
+
+        # 准备保存的数据
+        save_data = {
+            'pruning_candidates': {}
+        }
+
+        # 处理每个候选节点
+        for name, info in self.pruning_candidates.items():
+            save_data['pruning_candidates'][name] = {
+                'module_type': info['module_type'],
+                'pruning_ratio': info['pruning_ratio'],
+                'mask': info['mask'].tolist(),
+                'importance': info['importance'].tolist()
+            }
+
+        # 保存到文件
+        import json
+        import numpy as np
+
+        # 转换numpy数组为列表
+        def convert_to_serializable(obj):
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+            raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
+
+        # 保存文件
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(save_data, f, indent=2, ensure_ascii=False, default=convert_to_serializable)
+
+        print(f"✅ 剪枝候选信息已保存到: {path}")
+
+    def load_pruning_candidates(self, path: str):
+        """从文件加载剪枝候选信息"""
+        import json
+        import numpy as np
+
+        if not os.path.exists(path):
+            print(f"⚠️  剪枝候选信息文件不存在: {path}")
+            return False
+
+        # 加载文件
+        with open(path, 'r', encoding='utf-8') as f:
+            save_data = json.load(f)
+
+        # 恢复剪枝候选信息
+        candidates = save_data.get('pruning_candidates', {})
+
+        # 处理每个候选节点
+        for name, info in candidates.items():
+            self.pruning_candidates[name] = {
+                'module_type': info['module_type'],
+                'pruning_ratio': info['pruning_ratio'],
+                'mask': torch.tensor(info['mask']),
+                'importance': torch.tensor(info['importance'])
+            }
+
+        print(f"✅ 剪枝候选信息已加载，共 {len(self.pruning_candidates)} 个候选节点")
+        return True
 
     def is_pruning_time(self, epoch: int) -> bool:
         """检查是否到达剪枝时间"""

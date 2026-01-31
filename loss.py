@@ -27,13 +27,13 @@ class EnhancedCTCLoss(nn.Module):
                  eos_penalty_decay: float = 0.9,       # 尾部惩罚衰减系数
                  eos_window_size: int = 3,             # 尾部窗口大小
                  eos_adaptive: bool = True,            # 是否使用自适应尾部惩罚
-                 char_focal: int = 1,                  # Focal Loss类型：0-不启用，1-字符级，2-样本级
+                 char_focal: int = 0,                  # Focal Loss类型：0-不启用，1-字符级，2-样本级
                  focal_gamma: float = 2.0,             # Focal Loss gamma参数
                  focal_scale: float = 1.0,             # Focal Loss缩放因子
                  adaptive_margin: bool = False,        # 是否启用自适应Margin
                  margin: float = 0.3,                  # 固定Margin值
                  margin_max: float = 0.5,              # 自适应Margin最大值
-                 temperature_annealing: bool = False,  # 是否启用温度退火
+                 temperature_annealing: bool = True,  # 是否启用温度退火
                  gradient_clip: bool = True,           # 是否启用梯度裁剪
                  reduction: str = 'mean'):
         super().__init__()
@@ -444,6 +444,11 @@ class DistillationLoss(nn.Module):
         self.alpha_feat = alpha_feat
         self.alpha_logit = alpha_logit
 
+    def schedule(self, epoch: int, max_epoch: int):
+        """
+        学习率衰减调度
+        """
+
     def forward(
         self,
         teacher_features: torch.Tensor,
@@ -557,6 +562,11 @@ class QuantizationAwareLoss(torch.nn.Module):
         super().__init__()
         self.quantization_manager = quantization_manager
 
+    def schedule(self, epoch: int, max_epoch: int):
+        """
+        学习率衰减调度
+        """
+
     def forward(self, logits):
         # 如果有原始模型，计算量化损失
         if (self.quantization_manager.config['enabled'] and
@@ -586,6 +596,7 @@ class RecognitionLoss(nn.Module):
     """文本识别总损失"""
     def __init__(
         self,
+        max_epoch: int,
         vocab_size: int,
         ignore_index: int,
         ctc_weight: float,
@@ -596,6 +607,7 @@ class RecognitionLoss(nn.Module):
         quantization_manager = None,
     ):
         super().__init__()
+        self.max_epoch = max_epoch
         self.ignore_index = ignore_index
         self.ctc_weight = ctc_weight
         self.ar_weight = ar_weight
@@ -613,6 +625,14 @@ class RecognitionLoss(nn.Module):
         self.distill_loss = DistillationLoss()
 
         self.quantization_loss = QuantizationAwareLoss(quantization_manager)
+
+    def schedule(self, epoch: int, max_epoch: int):
+        """
+        学习率衰减调度
+        """
+        self.ctc_loss.schedule(epoch, max_epoch)
+        self.distill_loss.schedule(epoch, max_epoch)
+        self.quantization_loss.schedule(epoch, max_epoch)
 
     def forward(
         self,
