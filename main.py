@@ -205,7 +205,7 @@ def validate(device: str, model: torch.nn.Module, loader, criterion, epoch: int,
 
         with autocast(device, dtype=dtype):
             logits = model(images)               # B×T×V
-            loss = criterion(epoch, logits, labels, label_lens, targets_ce=labels_ce)
+            loss = criterion(logits, labels, label_lens, targets_ce=labels_ce)
 
         if use_ctc:
             cer, em_cnt = calculate_metrics(batch, logits, batch['labels'], use_ctc)
@@ -247,7 +247,7 @@ def train_one_epoch(device: str, model: torch.nn.Module, loader, criterion, opti
             logits = model(images, labels_ce, epoch=epoch, eval_mode=eval_mode)
             logits['input_features'] = images
 
-            loss = criterion(epoch, logits, labels, label_lens, targets_ce=labels_ce, mask=ar_mask)
+            loss = criterion(logits, labels, label_lens, targets_ce=labels_ce, mask=ar_mask)
 
         scaler.scale(loss['total_loss']).backward()
         scaler.step(optimizer)
@@ -520,6 +520,7 @@ def train_quantized_main(args, quantization_manager: QuantizationManager, quanti
                                                             criterion, optimizer, scaler, epoch, args.train_mode, eval_rate, dtype=dtype)
             val_loss, val_cer, val_em = validate(device, model, val_loader, criterion, epoch, args.train_mode, args.model_name, output_dir, args.max_text_length, dtype=dtype)
 
+            criterion.schedule(epoch)
             scheduler.step(epoch)
             current_lr = optimizer.param_groups[0]['lr']
 

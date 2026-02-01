@@ -567,7 +567,7 @@ class QuantizationAwareLoss(torch.nn.Module):
 
     def forward(self, logits):
         # 如果有原始模型，计算量化损失
-        if (self.quantization_manager.config['enabled'] and
+        if (self.quantization_manager and self.quantization_manager.config['enabled'] and
             hasattr(self.quantization_manager, 'original_model') and
             'input_features' in logits):
 
@@ -605,6 +605,7 @@ class RecognitionLoss(nn.Module):
         quantization_manager = None,
     ):
         super().__init__()
+        self.cur_epoch = 0
         self.max_epoch = max_epoch
         self.ignore_index = ignore_index
         self.ctc_weight = ctc_weight
@@ -624,17 +625,17 @@ class RecognitionLoss(nn.Module):
 
         self.quantization_loss = QuantizationAwareLoss(quantization_manager)
 
-    def schedule(self, epoch: int, max_epoch: int):
+    def schedule(self, epoch: int):
         """
         学习率衰减调度
         """
-        self.ctc_loss.schedule(epoch, max_epoch)
-        self.distill_loss.schedule(epoch, max_epoch)
-        self.quantization_loss.schedule(epoch, max_epoch)
+        self.cur_epoch = epoch
+        self.ctc_loss.schedule(epoch, self.max_epoch)
+        self.distill_loss.schedule(epoch, self.max_epoch)
+        self.quantization_loss.schedule(epoch, self.max_epoch)
 
     def forward(
         self,
-        epoch: int,
         predictions: Dict[str, torch.Tensor],
         targets: torch.Tensor,
         target_lengths: torch.Tensor,
@@ -684,7 +685,7 @@ class RecognitionLoss(nn.Module):
             loss_dict['ar_loss'] = torch.tensor(0.0, dtype=torch.float32)
 
         # 蒸馏损失（仅在训练时，且达到指定epoch后计算）
-        if self.training and epoch >= self.distill_start_epoch and all(k in predictions for k in ['ctc_logits', 'ar_logits', 'aligned_features']):
+        if self.training and self.cur_epoch >= self.distill_start_epoch and all(k in predictions for k in ['ctc_logits', 'ar_logits', 'aligned_features']):
             # 这里简化处理，实际应该使用教师模型的输出
             distill_losses = self.distill_loss(
                 teacher_features=predictions['ar_features'],
