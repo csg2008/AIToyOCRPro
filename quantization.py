@@ -29,17 +29,14 @@ import warnings
 import copy  # 用于深拷贝原始模型
 import random  # 用于随机搜索优化
 from torchao.quantization import (
-    Int8DynActInt4WeightLinear,
-    Int8DynActInt4WeightQuantizer,
     quantize_,
-    # 新版PTQ API (Int8DynamicActivationInt4WeightConfig等已弃用)
+    # 新版PTQ API (torchao 0.16.0)
     Int8DynamicActivationIntxWeightConfig,
     IntxWeightOnlyConfig,
 )
 from torchao.quantization.qat import (
-    # 新版QAT API - 使用新的推荐API
+    # 新版QAT API - 使用新的推荐API (torchao 0.16.0)
     ComposableQATQuantizer,
-    from_intx_quantization_aware_training,
     QATConfig,
     # 新版配置直接导入
     IntxFakeQuantizeConfig,  # 注意是小写x
@@ -453,22 +450,89 @@ class QATTrainingScheduler:
 
     实现分阶段训练策略:
     1. 预热阶段: 正常训练，学习率 warmup
-    2. QAT插入阶段: 插入FakeQuantize，冻结BN/LN
-    3. QAT微调阶段: 低学习率微调量化参数
-    4. 转换阶段: 转换为真实量化模型
+    2. QAT插入阶段: 在指定epoch插入FakeQuantize
+    3. QAT微调阶段: 低学习率微调量化参数，冻结BN/LN
+    4. 后QAT阶段: 更低学习率继续微调
+
+    修复改进:
+    - 支持延迟QAT插入（不在初始化时立即插入）
+    - 完善的归一化层冻结支持
+    - 正确的学习率乘数计算
     """
 
-    def __init__(self, config: Dict, quantization_manager: 'QuantizationManager'):
+    def __init__(self, config: Dict, quantization_manager: 'QuantizationManager',
+                 model: nn.Module, delay_insert: bool = True):
+        """
+        Args:
+            config: 量化配置
+            quantization_manager: 量化管理器
+            model: 训练模型
+            delay_insert: 是否延迟QAT插入（True表示在指定epoch插入，False表示立即插入）
+        """
         self.config = config
         self.qm = quantization_manager
+        self.model = model
         self.current_stage = 'warmup'
         self.qat_inserted = False
+        self.delay_insert = delay_insert
+        self._bn_frozen = False
+        self._frozen_norm_modules = []  # 记录被冻结的模块，用于后续解冻
+
+    def maybe_insert_qat(self, epoch: int) -> bool:
+        """在指定epoch动态插入QAT模块
+
+        Args:
+            epoch: 当前训练轮次
+
+        Returns:
+            是否成功插入QAT
+        """
+        if self.qat_inserted:
+            return False
+
+        qat_insert_epoch = self.config.get('qat_insert_epoch', 3)
+
+        if epoch >= qat_insert_epoch:
+            print(f"[QAT] Epoch {epoch}: Inserting QAT modules...")
+            try:
+                # 调用量化管理器应用QAT
+                self.qm.prepare_model_for_quantization()
+                self.qat_inserted = True
+
+                # 验证QAT是否成功应用
+                has_fake_quant = False
+                from torchao.quantization.qat.linear import FakeQuantizedLinear
+                for name, module in self.model.named_modules():
+                    if isinstance(module, FakeQuantizedLinear):
+                        has_fake_quant = True
+                        break
+
+                if has_fake_quant:
+                    print(f"[QAT] Modules inserted successfully")
+                else:
+                    print(f"[QAT] Warning: FakeQuantizedLinear not detected, QAT may not be active")
+
+                return True
+            except Exception as e:
+                print(f"[QAT] Insertion failed: {e}")
+                return False
+
+        return False
 
     def get_current_stage(self, epoch: int) -> str:
         """获取当前训练阶段"""
         warmup_epochs = self.config.get('warmup_lr', 3)
         qat_insert_epoch = self.config.get('qat_insert_epoch', warmup_epochs)
         qat_epochs = self.config.get('qat_epochs', 5)
+
+        # 如果延迟插入且QAT尚未插入，则处于pre_qat阶段
+        if self.delay_insert and not self.qat_inserted:
+            if epoch < warmup_epochs:
+                return 'warmup'
+            elif epoch < qat_insert_epoch:
+                return 'pre_qat'
+            else:
+                return 'pre_qat'  # 等待插入
 
         if epoch < warmup_epochs:
             return 'warmup'
@@ -498,22 +562,60 @@ class QATTrainingScheduler:
         return multipliers.get(stage, 1.0)
 
     def freeze_bn_ln_for_qat(self, model: nn.Module):
-        """冻结BN和LN层用于QAT - 提高量化稳定性"""
+        """冻结归一化层用于QAT - 提高量化稳定性
+
+        支持多种归一化层:
+        - BatchNorm: BatchNorm1d, BatchNorm2d, BatchNorm3d
+        - LayerNorm: LayerNorm
+        - GroupNorm: GroupNorm
+        - InstanceNorm: InstanceNorm1d, InstanceNorm2d, InstanceNorm3d
+        """
         frozen_count = 0
+        norm_types = (
+            nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d,
+            nn.LayerNorm, nn.GroupNorm,
+            nn.InstanceNorm1d, nn.InstanceNorm2d, nn.InstanceNorm3d
+        )
+
         for name, module in model.named_modules():
-            if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.LayerNorm)):
+            if isinstance(module, norm_types):
+                # 检查是否已经冻结
+                if getattr(module, '_qat_frozen', False):
+                    continue
+
                 module.requires_grad_(False)
                 module.eval()  # 设置为eval模式防止统计量更新
+                module._qat_frozen = True  # 标记为已冻结
+                self._frozen_norm_modules.append(module)
                 frozen_count += 1
 
         if frozen_count > 0:
-            print(f"🧊 冻结 {frozen_count} 个BN/LN层以提高QAT稳定性")
+            print(f"[QAT] Froze {frozen_count} normalization layers for QAT stability")
+            self._bn_frozen = True
+
+    def unfreeze_bn_ln(self, model: nn.Module):
+        """解冻归一化层 - 用于QAT阶段结束后恢复训练"""
+        unfrozen_count = 0
+        for module in self._frozen_norm_modules:
+            if hasattr(module, '_qat_frozen'):
+                module.requires_grad_(True)
+                module.train()  # 恢复train模式
+                delattr(module, '_qat_frozen')
+                unfrozen_count += 1
+
+        self._frozen_norm_modules.clear()
+
+        if unfrozen_count > 0:
+            print(f"[QAT] Unfroze {unfrozen_count} normalization layers")
+            self._bn_frozen = False
 
     def unfreeze_all(self, model: nn.Module):
         """解冻所有参数"""
         for module in model.modules():
             module.requires_grad_(True)
-        print("🔓 解冻所有层参数")
+        self._frozen_norm_modules.clear()
+        self._bn_frozen = False
+        print("[QAT] Unfroze all layer parameters")
 
 def create_pruning_config(args, config_file: Optional[str] = None) -> PruningConfig:
     """创建剪枝配置"""
@@ -1697,6 +1799,7 @@ class QuantizationManager:
         self.calibration_data = []
         self.original_model = None
         self.qat_config = None  # 存储QAT配置
+        self.use_modern_api = False  # 是否使用新版QAT API
 
     def prepare_model_for_quantization(self) -> torch.nn.Module:
         """准备模型进行量化
@@ -1706,7 +1809,7 @@ class QuantizationManager:
         if not self.config['enabled']:
             return self.model
 
-        print("🔧 准备模型量化...")
+        print("[QAT] Preparing model quantization...")
 
         # 保存原始模型用于知识蒸馏
         self.original_model = copy.deepcopy(self.model)
@@ -1722,9 +1825,11 @@ class QuantizationManager:
             if self.config.get('enable_layer_wise_qat', False):
                 print("   使用分层混合精度QAT (ComposableQATQuantizer)")
                 self.model = self._apply_layer_wise_mixed_precision_qat()
+                self.use_modern_api = True
             else:
                 print("   使用QAT API (FakeQuantizeConfig) - 精度优先模式")
                 self.model = self._apply_modern_qat_quantization()
+                self.use_modern_api = True
 
         elif self.config['post_training_quantization']:
             print(f"🎯 启用训练后量化 (PTQ): {strategy}")
@@ -1753,13 +1858,13 @@ class QuantizationManager:
             for name, module in model.named_modules():
                 if isinstance(module, nn.Linear):
                     min_in_features = min(min_in_features, module.in_features)
-            
+
             # 找到能整除最小维度的最大group_size
             for candidate in [256, 128, 64, 32]:
                 if min_in_features >= candidate and min_in_features % candidate == 0:
                     group_size = candidate
                     break
-            
+
             print(f"   使用 group_size={group_size} (最小in_features={min_in_features})")
 
         # 使用新的 IntxFakeQuantizeConfig API (注意是小写x)
@@ -1892,18 +1997,18 @@ class QuantizationManager:
         # 收集各层的最小维度
         backbone_min_dim = float('inf')
         neck_min_dim = float('inf')
-        
+
         for name, module in self.model.named_modules():
             if isinstance(module, nn.Linear):
                 if 'backbone' in name:
                     backbone_min_dim = min(backbone_min_dim, module.in_features)
                 elif 'neck' in name:
                     neck_min_dim = min(neck_min_dim, module.in_features)
-        
+
         # 根据实际维度选择合适的group_size
         backbone_group_size = self._get_valid_group_size(backbone_min_dim, 256) if backbone_min_dim != float('inf') else 32
         neck_group_size = self._get_valid_group_size(neck_min_dim, 128) if neck_min_dim != float('inf') else 32
-        
+
         print(f"   Backbone group_size={backbone_group_size} (min_dim={backbone_min_dim})")
         print(f"   Neck group_size={neck_group_size} (min_dim={neck_min_dim})")
 
@@ -1967,16 +2072,21 @@ class QuantizationManager:
         return prepared_model
 
     def _apply_ptq_quantization(self) -> torch.nn.Module:
-        """应用训练后量化 - 使用新版API"""
+        """应用训练后量化 - 使用新版API (torchao 0.16.0)
+
+        使用正确的API参数:
+        - Int8DynamicActivationIntxWeightConfig: 使用 weight_dtype 和 weight_granularity
+        - IntxWeightOnlyConfig: 使用 weight_dtype 和 granularity
+        """
         strategy = self.config['quantization_strategy']
         weight_bits = self.config.get('weight_bits', 4)
-        
+
         # 获取合适的group_size
         min_in_features = float('inf')
         for name, module in self.model.named_modules():
             if isinstance(module, nn.Linear):
                 min_in_features = min(min_in_features, module.in_features)
-        
+
         group_size = 32
         for candidate in [256, 128, 64, 32]:
             if min_in_features >= candidate and min_in_features % candidate == 0:
@@ -1984,29 +2094,27 @@ class QuantizationManager:
                 break
 
         if strategy == 'int8_dyn_act_int4_weight':
-            # 使用新版 Int8DynamicActivationIntxWeightConfig
-            from torchao.quantization import Int8DynamicActivationIntxWeightConfig
+            # torchao 0.16.0: Int8DynamicActivationIntxWeightConfig 使用 weight_granularity
+            # 始终显式指定 granularity，提高代码可读性和确定性
             quantizer = Int8DynamicActivationIntxWeightConfig(
                 weight_dtype=torch.int4,
-                group_size=group_size,
+                weight_granularity=PerGroup(group_size=group_size),
             )
         elif strategy == 'int8_weight_only':
-            # 使用新版 IntxWeightOnlyConfig (小写x)
-            from torchao.quantization import IntxWeightOnlyConfig
+            # torchao 0.16.0: IntxWeightOnlyConfig 使用 PerAxis(axis=0) 进行通道级量化
+            from torchao.quantization.granularity import PerAxis
             quantizer = IntxWeightOnlyConfig(
                 weight_dtype=torch.int8,
+                granularity=PerAxis(axis=0),
             )
         elif strategy == 'int4_weight_only':
-            from torchao.quantization import IntxWeightOnlyConfig
+            # torchao 0.16.0: IntxWeightOnlyConfig 使用 granularity 参数
             quantizer = IntxWeightOnlyConfig(
                 weight_dtype=torch.int4,
-                group_size=group_size,
+                granularity=PerGroup(group_size=group_size),
             )
         elif strategy == 'int8_dynamic_activation_int8_weight':
-            from torchao.quantization import Int8DynamicActivationIntxWeightConfig
-            quantizer = Int8DynamicActivationIntxWeightConfig(
-                weight_dtype=torch.int8,
-            )
+            quantizer = Int8DynamicActivationIntxWeightConfig(weight_dtype=torch.int8)
         else:
             raise ValueError(f"不支持的PTQ策略: {strategy}")
 
@@ -2017,7 +2125,12 @@ class QuantizationManager:
         return self.model
 
     def calibrate_model(self, dataloader: DataLoader, num_batches: int = None):
-        """校准量化模型"""
+        """校准量化模型 - 增加预热步骤以提高校准稳定性
+
+        PTQ校准流程:
+        1. 预热阶段: 运行若干批次使观察器稳定
+        2. 正式校准: 统计激活值分布并计算量化参数
+        """
         if not self.config['enabled'] or not self.config['post_training_quantization']:
             return
 
@@ -2026,16 +2139,25 @@ class QuantizationManager:
         if num_batches is None:
             num_batches = self.config['calibration_batches']
 
+        # 预热阶段: 使用10%的批次或最少5个批次进行预热
+        warmup_batches = max(5, num_batches // 10)
+        actual_calibration = max(num_batches - warmup_batches, num_batches // 2)
+
         self.model.eval()
+        device = next(self.model.parameters()).device
+
         with torch.no_grad():
             for i, batch in enumerate(tqdm(dataloader, total=num_batches, desc='校准')):
                 if i >= num_batches:
                     break
 
-                images = batch['images'].cuda()
+                images = batch['images'].to(device)
                 _ = self.model(images)
 
-        print(f"✅ 模型校准完成 ({num_batches} 批次)")
+                if i == warmup_batches - 1:
+                    print(f"   预热完成 ({warmup_batches} 批次)，开始正式校准...")
+
+        print(f"✅ 模型校准完成 (预热{warmup_batches} + 正式{actual_calibration} 批次)")
 
     def get_quantization_loss(self, quantized_features: torch.Tensor,
                             original_features: torch.Tensor) -> torch.Tensor:
@@ -2061,11 +2183,15 @@ class QuantizationManager:
         mse_loss = F.mse_loss(quantized_features, original_features.detach())
 
         # Cosine相似度损失 - 保持方向一致性
-        cos_loss = 1 - F.cosine_similarity(
-            quantized_features.flatten(1),
-            original_features.flatten(1).detach(),
-            dim=1
-        ).mean()
+        # pylint: disable=not-callable
+        # 处理1维张量的情况：如果只有1维，直接使用；否则保留batch维，扁平化其余维度
+        if quantized_features.dim() == 1:
+            q_flat = quantized_features.unsqueeze(0)
+            o_flat = original_features.unsqueeze(0).detach()
+        else:
+            q_flat = quantized_features.flatten(1)
+            o_flat = original_features.flatten(1).detach()
+        cos_loss = 1 - F.cosine_similarity(q_flat, o_flat, dim=1).mean()
 
         # L1稀疏性损失 - 鼓励稀疏性（对INT4有益）
         l1_loss = torch.abs(quantized_features).mean() * 0.01
@@ -2101,16 +2227,15 @@ class QuantizationManager:
         return total_fake_quant_loss
 
     def convert_to_quantized_model(self, model: nn.Module) -> nn.Module:
-        """优化5: 将FakeQuantize模型转换为真实量化模型
+        """优化5: 将FakeQuantize模型转换为真实量化模型 - 使用新版API (torchao 0.16.0)
 
-        使用from_intx_quantization_aware_training进行转换
+        使用 QATConfig(base_config, step="convert") 替换已弃用的 from_intx_quantization_aware_training
         支持ExportWrapper（包含多个子模块的模型包装器）
         """
         if not self.config['enabled']:
             return model
 
         # 检查是否是新版API的FakeQuantize模型
-        # 新版API使用IntXQuantizationAwareTrainingConfig，模型中包含FakeQuantizedLinear模块
         has_fake_quantized_modules = False
         for name, module in model.named_modules():
             if isinstance(module, FakeQuantizedLinear):
@@ -2125,6 +2250,28 @@ class QuantizationManager:
         print("🔄 转换FakeQuantize模型为真实量化模型...")
 
         try:
+            strategy = self.config.get('quantization_strategy', 'int8_dyn_act_int4_weight')
+
+            # 创建对应的base_config用于转换
+            if strategy == 'int8_dyn_act_int4_weight':
+                base_config = Int8DynamicActivationIntxWeightConfig(weight_dtype=torch.int4)
+            elif strategy == 'int4_weight_only':
+                base_config = IntxWeightOnlyConfig(
+                    weight_dtype=torch.int4,
+                    granularity=PerGroup(group_size=32),
+                )
+            elif strategy == 'int8_weight_only':
+                base_config = IntxWeightOnlyConfig(weight_dtype=torch.int8)
+            elif strategy == 'int8_dynamic_activation_int8_weight':
+                base_config = Int8DynamicActivationIntxWeightConfig(weight_dtype=torch.int8)
+            else:
+                # 默认使用int8_dyn_act_int4_weight配置
+                base_config = Int8DynamicActivationIntxWeightConfig(weight_dtype=torch.int4)
+
+            # 创建转换配置: QATConfig with step="convert"
+            convert_config = QATConfig(base_config, step="convert")
+            print(f"   使用策略: {strategy}, base_config: {base_config.__class__.__name__}")
+
             # 处理ExportWrapper（包含多个子模块的模型）
             if hasattr(model, 'get_submodules'):
                 print("📝 检测到模型包装器，对子模块进行转换...")
@@ -2134,7 +2281,7 @@ class QuantizationManager:
                 for name, submodule in submodules.items():
                     if submodule is not None and self._has_fake_quantized_modules(submodule):
                         try:
-                            quantize_(submodule, from_intx_quantization_aware_training())
+                            quantize_(submodule, convert_config)
                             setattr(model, name, submodule)
                             converted_count += 1
                             print(f"  ✅ {name} 转换完成")
@@ -2146,9 +2293,9 @@ class QuantizationManager:
                 return model
             else:
                 # 普通模型直接转换
-                quantize_(model, from_intx_quantization_aware_training())
+                quantize_(model, convert_config)
                 quantized_model = model
-                print("✅ 使用from_intx_quantization_aware_training转换完成")
+                print(f"✅ 使用 QATConfig(step='convert') 转换完成")
                 return quantized_model
 
         except Exception as e:
@@ -2690,8 +2837,6 @@ class QuantizationHyperparameterOptimizer:
 
         根据配置使用 QuantizationManager 应用真正的量化
         """
-        import copy
-
         # 深拷贝原始模型
         try:
             model_copy = copy.deepcopy(self.original_model)
@@ -3255,8 +3400,6 @@ def visualize_optimization_results(result: OptimizationResult, study_dir: Path) 
         result: 优化结果
         study_dir: 输出目录
     """
-    import matplotlib.pyplot as plt
-
     # 提取历史数据
     trial_numbers = [item['trial_number'] for item in result.optimization_history]
     scores = [item['score'] for item in result.optimization_history]

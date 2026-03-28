@@ -425,13 +425,16 @@ class ONNXExporter(ModelExporter):
     
     def _convert_qat_to_quantized(self, model: nn.Module) -> nn.Module:
         """
-        将QAT伪量化模型转换为真量化模型
+        将QAT伪量化模型转换为真量化模型 - 使用新版API (torchao 0.16.0)
         
-        支持两种API:
-        - 新版API (FakeQuantizeConfig): 使用 from_intx_quantization_aware_training
-        - 旧版API (Int8DynActInt4WeightQATQuantizer): 使用 quantize_
+        新版API使用 QATConfig(base_config, step="convert") 进行转换
+        替代已弃用的 from_intx_quantization_aware_training
         
-        修复: 正确处理ExportWrapper，确保转换后返回新的模型实例，避免引用丢失
+        支持策略:
+        - int8_dyn_act_int4_weight: INT8动态激活 + INT4权重
+        - int8_weight_only: 纯INT8权重量化
+        - int4_weight_only: 纯INT4权重量化
+        - int8_dynamic_activation_int8_weight: 纯INT8量化
         
         Args:
             model: QAT训练后的模型（可能是 ExportWrapper 或 FakeQuantizer）
@@ -447,10 +450,10 @@ class ONNXExporter(ModelExporter):
             
             if is_modern_api:
                 # 新版API: 使用 QATConfig 转换 (step="convert")
-                logger.info("🔄 检测到新版QAT API，使用 QATConfig(step='convert') 转换...")
+                logger.info("🔄 检测到新版QAT API，使用 QATConfig(base_config, step='convert') 转换...")
                 
                 try:
-                    from torchao.quantization import quantize_
+                    from torchao.quantization import quantize_, Int8DynamicActivationIntxWeightConfig, IntxWeightOnlyConfig
                     from torchao.quantization.qat import QATConfig
                     
                     # 处理 FakeQuantizer 包装的模型 - 先解包获取真实模型
@@ -460,8 +463,34 @@ class ONNXExporter(ModelExporter):
                         logger.info("🔓 解包 FakeQuantizer 获取原始模型")
                     
                     # 创建转换配置 (step="convert" 用于将 fake quant 转换为真实量化)
-                    # 新API: 使用 QATConfig(step="convert") 自动推断之前的配置
-                    convert_config = QATConfig(step="convert")
+                    # torchao 0.16.0: QATConfig 必须指定 base_config 参数
+                    # 根据量化策略选择正确的 base_config
+                    strategy = self.quantization_config.get('quantization_strategy', 'int8_dyn_act_int4_weight')
+                    
+                    # 导入 granularity 模块
+                    from torchao.quantization.granularity import PerGroup
+                    
+                    if strategy == 'int8_dyn_act_int4_weight':
+                        # torchao 0.16.0: Int8DynamicActivationIntxWeightConfig 使用 weight_dtype
+                        # 默认 weight_granularity=PerGroup(group_size=32)
+                        base_config = Int8DynamicActivationIntxWeightConfig(weight_dtype=torch.int4)
+                    elif strategy == 'int8_weight_only':
+                        base_config = IntxWeightOnlyConfig(weight_dtype=torch.int8)
+                    elif strategy == 'int4_weight_only':
+                        # IntxWeightOnlyConfig 需要显式指定 PerGroup
+                        base_config = IntxWeightOnlyConfig(
+                            weight_dtype=torch.int4,
+                            granularity=PerGroup(group_size=32),
+                        )
+                    elif strategy == 'int8_dynamic_activation_int8_weight':
+                        base_config = Int8DynamicActivationIntxWeightConfig(weight_dtype=torch.int8)
+                    else:
+                        logger.warning(f"⚠️ 未知的量化策略: {strategy}，使用默认策略")
+                        base_config = Int8DynamicActivationIntxWeightConfig(weight_dtype=torch.int4)
+                    
+                    # torchao 0.16.0 API: QATConfig 需要 base_config 和 step="convert"
+                    convert_config = QATConfig(base_config, step="convert")
+                    logger.info(f"   使用 base_config: {base_config.__class__.__name__}, 策略: {strategy}")
                     
                     # 对于 ExportWrapper，需要分别转换子模块
                     if hasattr(inner_model, 'get_submodules'):
@@ -503,37 +532,30 @@ class ONNXExporter(ModelExporter):
                 Int8DynamicActivationIntxWeightConfig,
                 IntxWeightOnlyConfig,
             )
+            from torchao.quantization.granularity import PerGroup
             
             # 获取量化策略
             strategy = self.quantization_config.get('quantization_strategy', 'int8_dyn_act_int4_weight')
             
             logger.info(f"🎯 应用量化策略: {strategy}")
             
-            # 根据策略选择量化器 - 使用新版API
+            # 根据策略选择量化器 - 使用新版API (torchao 0.16.0)
             if strategy == 'int8_dyn_act_int4_weight':
-                quantizer = Int8DynamicActivationIntxWeightConfig(
-                    weight_dtype=torch.int4,
-                    group_size=32,
-                )
+                # Int8DynamicActivationIntxWeightConfig 默认使用 PerGroup(group_size=32)
+                quantizer = Int8DynamicActivationIntxWeightConfig(weight_dtype=torch.int4)
             elif strategy == 'int8_weight_only':
-                quantizer = IntxWeightOnlyConfig(
-                    weight_dtype=torch.int8,
-                )
+                quantizer = IntxWeightOnlyConfig(weight_dtype=torch.int8)
             elif strategy == 'int4_weight_only':
+                # IntxWeightOnlyConfig 需要显式指定 PerGroup
                 quantizer = IntxWeightOnlyConfig(
                     weight_dtype=torch.int4,
-                    group_size=32,
+                    granularity=PerGroup(group_size=32),
                 )
             elif strategy == 'int8_dynamic_activation_int8_weight':
-                quantizer = Int8DynamicActivationIntxWeightConfig(
-                    weight_dtype=torch.int8,
-                )
+                quantizer = Int8DynamicActivationIntxWeightConfig(weight_dtype=torch.int8)
             else:
                 logger.warning(f"⚠️ 未知的量化策略: {strategy}，使用默认策略")
-                quantizer = Int8DynamicActivationIntxWeightConfig(
-                    weight_dtype=torch.int4,
-                    group_size=32,
-                )
+                quantizer = Int8DynamicActivationIntxWeightConfig(weight_dtype=torch.int4)
             
             # 处理 FakeQuantizer 包装的模型
             inner_model = model

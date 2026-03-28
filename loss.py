@@ -568,7 +568,7 @@ class QuantizationAwareLoss(torch.nn.Module):
     def forward(self, logits):
         # 如果有原始模型，计算量化损失
         if (self.quantization_manager and self.quantization_manager.config['enabled'] and
-            hasattr(self.quantization_manager, 'original_model') and
+            getattr(self.quantization_manager, 'original_model', None) is not None and
             'input_features' in logits):
 
             # 获取原始模型的输出作为教师信号
