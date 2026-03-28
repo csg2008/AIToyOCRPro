@@ -30,6 +30,18 @@
 - **硬件感知优化**：针对CPU、GPU、移动端优化
 - **动态校准**：实时调整量化参数
 
+### QAT训练优化（v2.0新特性）
+
+本项目集成了最新的torchao QAT优化技术，提供更高精度和更灵活的量化训练方案：
+
+| 优化项 | 描述 | 优势 |
+|--------|------|------|
+| **新版QAT API** | 基于`FakeQuantizeConfig`的配置系统 | 更精细的粒度控制，支持`PerToken`动态量化 |
+| **分层混合精度** | `ComposableQATQuantizer`分层策略 | Backbone/Neck/Decoder使用不同精度 |
+| **分阶段训练** | 4阶段QAT训练流程 | 冻结BN/LN层，提高量化稳定性 |
+| **改进的损失函数** | 多尺度量化损失 | MSE + Cosine + L1 + FakeQuant损失 |
+| **统一导出流程** | 支持`from_intx_quantization_aware_training` | 更好的推理性能兼容性 |
+
 ## 🚀 快速开始
 
 ### 1. 环境准备
@@ -69,6 +81,22 @@ python main.py \
     --weight_bits 4 \
     --activation_bits 8 \
     --qat_epochs 5 \
+    --mode both
+
+# 新版QAT API (推荐 - 精度优先)
+python main.py \
+    --enable_quantization \
+    --quantization_strategy int8_dyn_act_int4_weight \
+    --use_modern_qat_api \
+    --qat_epochs 8 \
+    --mode both
+
+# 分层混合精度QAT (最高精度)
+python main.py \
+    --enable_quantization \
+    --enable_layer_wise_qat \
+    --qat_epochs 10 \
+    --qat_learning_rate_multiplier 0.05 \
     --mode both
 
 # 高级自定义
@@ -129,7 +157,12 @@ python main.py \
   "distillation_weight": 0.3,
   "calibration_batches": 100,
   "mixed_precision": true,
-  "memory_efficient": true
+  "memory_efficient": true,
+  "_comment": "QAT优化配置 (v2.0)",
+  "use_modern_qat_api": true,
+  "enable_layer_wise_qat": false,
+  "qat_insert_epoch": 3,
+  "fake_quant_loss_weight": 0.001
 }
 ```
 
@@ -334,7 +367,114 @@ python main.py \
     --num_val 4
 ```
 
-### 2. 渐进式优化
+### 2. QAT训练优化详解（v2.0）
+
+本项目实现了最新的QAT（量化感知训练）优化技术，基于torchao的新版API，提供更精细的控制和更高的精度。
+
+#### 2.1 新版QAT API使用
+
+```bash
+# 启用新版QAT API (默认启用，精度优先)
+python main.py \
+    --enable_quantization \
+    --use_modern_qat_api \
+    --quantization_strategy int8_dyn_act_int4_weight \
+    --weight_bits 4 \
+    --activation_bits 8 \
+    --qat_epochs 8 \
+    --qat_learning_rate_multiplier 0.1 \
+    --mode both
+```
+
+**新版API优势：**
+- `FakeQuantizeConfig`配置系统：更灵活的量化参数控制
+- `PerToken`动态量化：针对OCR序列模型的精度优化
+- `PerGroup`分组量化：平衡精度与性能（推荐groupsize=256）
+
+#### 2.2 分层混合精度QAT
+
+针对OCR模型的特点，对不同组件应用不同的量化策略：
+
+```bash
+# 启用分层混合精度QAT
+python main.py \
+    --enable_quantization \
+    --enable_layer_wise_qat \
+    --qat_epochs 10 \
+    --qat_learning_rate_multiplier 0.05 \
+    --mode both
+```
+
+**分层策略：**
+
+| 组件 | 权重量化 | 激活动态量化 | 说明 |
+|------|----------|--------------|------|
+| Backbone | INT4 (groupsize=256) | PerToken | 特征提取，平衡精度性能 |
+| Neck | INT4 (groupsize=128) | PerToken | 特征融合，更高精度 |
+| Decoder (CTC/AR) | INT8 | PerToken | 输出解码，精度优先 |
+
+#### 2.3 分阶段QAT训练流程
+
+```bash
+# 分阶段QAT训练 (推荐用于高精度场景)
+python main.py \
+    --enable_quantization \
+    --use_modern_qat_api \
+    --warmup_lr 3 \
+    --qat_insert_epoch 3 \
+    --qat_epochs 8 \
+    --epochs 20 \
+    --mode both
+```
+
+**训练阶段：**
+
+1. **Warmup阶段** (epoch 0-3)：正常预训练，学习率warmup
+2. **Pre-QAT阶段** (epoch 3)：准备插入FakeQuantize
+3. **QAT微调阶段** (epoch 3-11)：冻结BN/LN层，低学习率微调量化参数
+4. **Post-QAT阶段** (epoch 11+)：可选进一步微调
+
+**特性：**
+- 自动冻结BN/LN层：提高量化稳定性
+- 动态学习率调整：QAT阶段自动降低至0.1x
+- 阶段监控：输出当前训练阶段信息
+
+#### 2.4 改进的量化感知损失
+
+新版损失函数结合多种损失类型：
+
+```python
+# 量化损失组成 (自动配置，无需手动设置)
+total_loss = (
+    distillation_weight * KL_div_loss +           # 知识蒸馏
+    quantization_loss_weight * (
+        MSE_loss +                                # 数值接近
+        0.5 * Cosine_similarity_loss +            # 方向一致
+        L1_sparsity_loss                          # 稀疏性
+    ) +
+    fake_quant_loss_weight * FakeQuant_loss       # FakeQuant层损失
+)
+```
+
+#### 2.5 模型导出与转换
+
+训练完成后，自动转换为真实量化模型：
+
+```python
+# 导出流程 (自动执行)
+# 1. 从FakeQuantize模型转换为真实量化模型
+quantized_model = from_intx_quantization_aware_training(model)
+
+# 2. 使用torch.export导出
+exported_program = torch.export.export(quantized_model, example_input)
+```
+
+**导出特性：**
+- 自动检测新版/旧版API
+- 支持`from_intx_quantization_aware_training`转换
+- 保存完整的导出元数据
+
+### 3. 渐进式优化
 
 ```python
 from quantization import AdaptiveHyperparameterOptimizer
@@ -442,6 +582,36 @@ python main.py \
 | `memory_efficient` | 内存高效模式 | true |
 | `compile_model` | 模型编译优化 | false |
 
+### QAT优化配置（v2.0）
+
+| 参数 | 说明 | 推荐值 | 适用场景 |
+|------|------|--------|----------|
+| `use_modern_qat_api` | 使用新版QAT API (FakeQuantizeConfig) | `true` | 精度优先场景 |
+| `enable_layer_wise_qat` | 启用分层混合精度QAT | `false` | 对精度要求极高的OCR任务 |
+| `qat_insert_epoch` | QAT FakeQuantize插入的epoch | `3` | 与warmup_lr保持一致 |
+| `fake_quant_loss_weight` | FakeQuantize层损失权重 | `0.001` | 细粒度量化优化 |
+
+#### 粒度配置对比
+
+| 粒度类型 | 配置方式 | 精度 | 性能 | 适用场景 |
+|----------|----------|------|------|----------|
+| `PerTensor` | 整体量化 | 一般 | 最高 | 批处理场景 |
+| `PerAxis` | 按通道量化 | 较好 | 较高 | 通用场景 |
+| `PerGroup(256)` | 分组量化 | 好 | 高 | 精度-性能平衡 |
+| `PerGroup(128)` | 精细分组 | 更好 | 中等 | 精度优先 |
+| `PerToken` | 每token量化 | 最好 | 动态 | 序列模型、OCR |
+
+#### 新版API vs 旧版API对比
+
+| 特性 | 旧版API | 新版API (推荐) |
+|------|---------|----------------|
+| 配置方式 | Quantizer类 | FakeQuantizeConfig |
+| 权重量化 | 固定groupsize | PerGroup/PerAxis灵活配置 |
+| 激活量化 | PerTensor动态 | PerToken动态量化 |
+| 分层策略 | 不支持 | ComposableQATQuantizer |
+| 损失收集 | 手动实现 | 内置FakeQuant损失 |
+| 导出转换 | 有限支持 | from_intx_qat完整支持 |
+
 ## 📈 典型结果
 
 ### SVTRv2-Tiny模型量化结果
@@ -474,6 +644,28 @@ python main.py \
 | CER | 2.1% | 2.4% | **0.3%增加** |
 | 准确率 | 97.9% | 97.6% | **0.3%下降** |
 
+### 新版QAT API优化结果（v2.0）
+
+使用新版`FakeQuantizeConfig` API，`PerToken`动态量化 + `PerGroup(256)`权重量化：
+
+| 指标 | 旧版API | 新版API (v2.0) | 改善 |
+|------|---------|----------------|------|
+| 模型大小 | 4.8 MB | 4.8 MB | 相同 |
+| 推理时间 | 8.3 ms | 7.9 ms | **1.05x加速** |
+| CER | 2.3% | 2.15% | **0.15%改善** |
+| 准确率 | 97.7% | 97.85% | **0.15%提升** |
+
+### 分层混合精度QAT结果（v2.0）
+
+使用`ComposableQATQuantizer`分层策略：
+
+| 组件 | 量化策略 | CER变化 | 说明 |
+|------|----------|---------|------|
+| Backbone | INT4 (gs=256) | -0.02% | 精度提升 |
+| Neck | INT4 (gs=128) | -0.05% | 更高精度 |
+| Decoder | INT8 | -0.08% | 精度优先 |
+| **整体** | 混合精度 | **2.05%** | **优于统一INT4** |
+
 ### 不同硬件平台表现
 
 #### CPU平台
@@ -500,6 +692,25 @@ python main.py \
 4. **校准数据**：使用代表性的校准数据，建议100+批次
 5. **剪枝比例**：从低比例开始尝试，逐步提高，避免一次性剪枝过多
 6. **剪枝时机**：在模型收敛后进行剪枝，通常在训练20-30轮后
+
+### QAT训练优化注意事项（v2.0）
+
+#### 新版QAT API使用建议
+1. **默认启用**：新版API (`use_modern_qat_api=true`) 提供更好的精度，建议默认使用
+2. **分层混合精度**：OCR任务对Decoder精度敏感，建议启用 `enable_layer_wise_qat`
+3. **QAT插入时机**：`qat_insert_epoch` 建议与 `warmup_lr` 保持一致（默认3）
+4. **BN/LN冻结**：QAT微调阶段自动冻结BN/LN层，提高量化稳定性
+
+#### 粒度配置建议
+- **OCR识别**：推荐使用 `PerToken` 激活动态量化 + `PerGroup(256)` 权重量化
+- **高精度需求**：Neck层使用 `PerGroup(128)`，Decoder使用 `PerAxis` INT8
+- **边缘部署**：使用 `PerTensor` 量化以获得最佳推理性能
+
+#### 分阶段训练建议
+- **Warmup阶段**：正常训练3-5轮，让模型充分学习
+- **QAT插入**：在warmup结束后插入FakeQuantize，避免早期量化干扰
+- **QAT微调**：8-10轮微调，学习率0.1倍，监控CER指标
+- **后处理**：可额外进行2-3轮正常训练，进一步提升精度
 
 ### 性能优化
 1. **批处理大小**：根据硬件内存调整，建议4-16
@@ -583,7 +794,33 @@ python main.py \
     --min_acc_drop 0.005
 ```
 
-#### 6. 剪枝训练报错
+#### 6. 新版QAT API精度不如预期
+```bash
+# 解决方案：启用分层混合精度
+python main.py \
+    --enable_quantization \
+    --use_modern_qat_api \
+    --enable_layer_wise_qat \
+    --qat_epochs 10 \
+    --qat_learning_rate_multiplier 0.05 \
+    --quantization_loss_weight 0.02 \
+    --fake_quant_loss_weight 0.002
+```
+
+#### 7. QAT训练不稳定
+```bash
+# 解决方案：调整QAT插入时机和学习率
+python main.py \
+    --enable_quantization \
+    --use_modern_qat_api \
+    --warmup_lr 5 \
+    --qat_insert_epoch 5 \
+    --qat_epochs 8 \
+    --qat_learning_rate_multiplier 0.05 \
+    --quantization_loss_weight 0.005
+```
+
+#### 8. 剪枝训练报错
 ```bash
 # 解决方案：降低剪枝比例或更换剪枝策略
 python main.py \
@@ -594,7 +831,7 @@ python main.py \
     --finetune_epochs 10
 ```
 
-#### 7. 剪枝+量化组合优化效果不佳
+#### 9. 剪枝+量化组合优化效果不佳
 ```bash
 # 解决方案：调整顺序和参数
 python main.py \

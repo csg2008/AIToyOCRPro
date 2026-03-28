@@ -26,7 +26,8 @@ from quantization import (
     QuantizationConfig, AdaptiveQuantizationConfig,
     QuantizationEvaluator, QuantizationMetrics,
     create_optimal_config, get_config_template, create_optimization_study,
-    PruningManager, create_pruning_config
+    PruningManager, create_pruning_config,
+    QATTrainingScheduler,  # 优化3: 分阶段QAT训练调度器
 )
 
 
@@ -90,6 +91,14 @@ def parse_args():
     parser.add_argument('--qat_epochs', type=int, default=5, help='QAT训练轮数')
     parser.add_argument('--weight_bits', type=int, default=4, help='权重量化位数')
     parser.add_argument('--activation_bits', type=int, default=8, help='激活量化位数')
+    
+    # 优化1: 分层混合精度QAT
+    parser.add_argument('--enable_layer_wise_qat', action='store_true', default=False,
+                       help='启用分层混合精度QAT (ComposableQATQuantizer)')
+    
+    # 优化3: 分阶段QAT训练
+    parser.add_argument('--qat_insert_epoch', type=int, default=None,
+                       help='QAT FakeQuantize插入的epoch (默认与warmup_lr相同)')
 
     # 量化优化研究配置
     parser.add_argument('--study_name', type=str, help='优化研究名称')
@@ -387,6 +396,12 @@ def train_quantized_main(args, quantization_manager: QuantizationManager, quanti
         use_bf16 = torch.cuda.is_bf16_supported()
 
     print(f"💡 bf16支持: {'是' if use_bf16 else '否'}")
+    
+    # 优化3: 初始化QAT训练调度器 (分阶段QAT)
+    qat_scheduler = None
+    if quantization_config.get('enabled') and quantization_config.get('quantization_aware_training'):
+        qat_scheduler = QATTrainingScheduler(quantization_config, quantization_manager)
+        print("📅 初始化QAT分阶段训练调度器")
 
     # 已有 amp，再打开：
     # 使用新的API设置控制TF32行为，避免PyTorch 2.9后的弃用警告
@@ -496,12 +511,24 @@ def train_quantized_main(args, quantization_manager: QuantizationManager, quanti
         for epoch in range(start_epoch, args.epochs):
             print(f'\n----- Epoch {epoch} -- LR {current_lr:.6f} -- scale {scaler.get_scale()} -----')
 
-            # 调整学习率
+            # 调整学习率 - 优化3: 集成QAT训练调度器
             lr_multipliers = []
 
-            # QAT阶段学习率调整
-            qat_lr_multiplier = get_quantization_scheduler(epoch, quantization_config)
-            lr_multipliers.append(qat_lr_multiplier)
+            # QAT分阶段学习率调整 (新版调度器)
+            if qat_scheduler is not None:
+                stage = qat_scheduler.get_current_stage(epoch)
+                stage_lr_multiplier = qat_scheduler.get_lr_multiplier(epoch)
+                lr_multipliers.append(stage_lr_multiplier)
+                
+                # 检查是否需要冻结BN/LN层
+                if qat_scheduler.should_freeze_bn_ln(epoch) and not getattr(qat_scheduler, '_bn_frozen', False):
+                    qat_scheduler.freeze_bn_ln_for_qat(model)
+                    qat_scheduler._bn_frozen = True
+                    print(f"🧊 Epoch {epoch}: 进入QAT微调阶段，冻结BN/LN层")
+            else:
+                # 回退到旧版QAT学习率调整
+                qat_lr_multiplier = get_quantization_scheduler(epoch, quantization_config)
+                lr_multipliers.append(qat_lr_multiplier)
 
             # 剪枝微调阶段学习率调整
             finetune_lr_multiplier = pruning_manager.get_finetune_lr_multiplier(epoch)
@@ -515,6 +542,11 @@ def train_quantized_main(args, quantization_manager: QuantizationManager, quanti
             # 应用学习率调整
             for param_group in optimizer.param_groups:
                 param_group['lr'] = param_group['lr'] * total_lr_multiplier
+            
+            # 打印当前阶段信息
+            if qat_scheduler is not None:
+                stage = qat_scheduler.get_current_stage(epoch)
+                print(f'   [阶段: {stage}] [LR乘数: {total_lr_multiplier:.3f}]')
 
             train_loss, train_cer, train_em = train_one_epoch(device, model, train_loader,
                                                             criterion, optimizer, scaler, epoch, args.train_mode, eval_rate, dtype=dtype)
@@ -703,6 +735,13 @@ def prepare_quantized_manage(args, config: QuantizationConfig, model: nn.Module,
     quantization_config['weight_bits'] = args.weight_bits
     quantization_config['activation_bits'] = args.activation_bits
     quantization_config['quantization_granularity'] = 'per_channel'
+    
+    # 优化1&2: 传递新配置参数
+    quantization_config['enable_layer_wise_qat'] = args.enable_layer_wise_qat
+    quantization_config['qat_insert_epoch'] = args.qat_insert_epoch if args.qat_insert_epoch is not None else args.warmup_lr
+    
+    if quantization_config['enable_layer_wise_qat']:
+        print(f"🔧 分层混合精度QAT: 启用")
     quantization_config['observer_type'] = 'moving_average'
     quantization_config['observer_momentum'] = 0.1
 
@@ -713,7 +752,7 @@ def prepare_quantized_manage(args, config: QuantizationConfig, model: nn.Module,
         print(f"💾 量化配置已保存: {config_path}")
 
     print("✅ 初始化量化管理器...")
-    quantization_manager = QuantizationManager(quantization_config, model)
+    quantization_manager = QuantizationManager(model, quantization_config)
 
     # 应用量化
     model = quantization_manager.prepare_model_for_quantization()
@@ -721,9 +760,25 @@ def prepare_quantized_manage(args, config: QuantizationConfig, model: nn.Module,
     return quantization_manager, quantization_config, model
 
 def evaluate_quantization(original_model: nn.Module, quantized_model: nn.Module,
-                         args, config: QuantizationConfig, device: str, output_dir: str):
-    """评估量化效果"""
+                         args, config: QuantizationConfig, device: str, output_dir: str,
+                         quantization_manager: 'QuantizationManager' = None):
+    """评估量化效果
+    
+    Args:
+        quantization_manager: 量化管理器，用于转换新版API的FakeQuantize模型
+    """
     print("🔍 开始量化效果评估...")
+    
+    # 如果是新版API的FakeQuantize模型，先转换为真实量化模型
+    if quantization_manager is not None:
+        if hasattr(quantization_manager, 'use_modern_api') and quantization_manager.use_modern_api:
+            if hasattr(quantization_manager, 'convert_to_quantized_model'):
+                print("🔄 评估前转换FakeQuantize模型为真实量化模型...")
+                try:
+                    quantized_model = quantization_manager.convert_to_quantized_model(quantized_model)
+                    print("✅ 模型转换完成，使用真实量化模型进行评估")
+                except Exception as e:
+                    print(f"⚠️  模型转换失败，使用原始量化模型进行评估: {e}")
 
     # 创建评估器
     evaluator = QuantizationEvaluator(original_model, quantized_model, device)
@@ -947,7 +1002,7 @@ def main():
     # 评估模式
     if success and args.mode in ['evaluate', 'both']:
         # 评估量化效果
-        metrics = evaluate_quantization(model, quantized_model, args, config, device, output_dir)
+        metrics = evaluate_quantization(model, quantized_model, args, config, device, output_dir, quantization_manager)
 
         # 保存模型
         save_models(model, quantized_model, args, config, output_dir)

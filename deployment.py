@@ -121,14 +121,30 @@ def ctc_decode_v2(pred: List[int], skip_tokens: List[int]) -> List[int]:
     return pred
 
 class ExportWrapper(torch.nn.Module):
-    """简化的推理模型包装器"""
+    """简化的推理模型包装器
+    
+    支持:
+    - 普通RecNetwork模型
+    - FakeQuantizer包装的模型（新版QAT API）
+    - 已转换的真实量化模型
+    """
     def __init__(self, model: nn.Module):
         super().__init__()
 
         model.eval()
-        self.backbone = model.backbone
-        self.neck     = model.neck
-        self.head = model.decoder.ctc_decoder
+        
+        # 处理 FakeQuantizer 包装的模型（新版QAT API）
+        # FakeQuantizer 包装时会把原模型放在 model 属性中
+        inner_model = model
+        if hasattr(model, 'model') and 'FakeQuantizer' in model.__class__.__name__:
+            # 解包 FakeQuantizer 获取真实模型 (包括 IntxFakeQuantizer, Int8FakeQuantizer 等)
+            inner_model = model.model
+            logger.info(f"🔓 ExportWrapper: 自动解包 {model.__class__.__name__} 模型")
+        
+        # 提取子模块
+        self.backbone = inner_model.backbone
+        self.neck     = inner_model.neck
+        self.head = inner_model.decoder.ctc_decoder
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -139,6 +155,14 @@ class ExportWrapper(torch.nn.Module):
         feat = self.neck(feat)           # 训练时 neck 需要 target，推理不用
         out  = self.head(feat)           # 内部已 log_softmax
         return out
+    
+    def get_submodules(self) -> Dict[str, nn.Module]:
+        """获取子模块字典，用于量化转换"""
+        return {
+            'backbone': self.backbone,
+            'neck': self.neck,
+            'head': self.head
+        }
 
 class ModelExporter(ABC):
     """模型导出器基类"""
@@ -166,12 +190,53 @@ class ModelExporter(ABC):
         pass
 
 class ONNXExporter(ModelExporter):
-    """ONNX导出器"""
+    """ONNX导出器
+    
+    修复: 在初始化时完成量化模型转换，避免引用不一致问题
+    """
 
     def __init__(self, model: nn.Module, output_dir: str, vocab: list = None, other_pad_size: int = 0,
-                 blank_id: int = 0, sos_id: int = 1, eos_id: int = 2, idx2char: dict = None, opset_version: int = 18):
-        super().__init__(model, output_dir, vocab, other_pad_size, blank_id, sos_id, eos_id, idx2char)
+                 blank_id: int = 0, sos_id: int = 1, eos_id: int = 2, idx2char: dict = None, 
+                 opset_version: int = 18, quantization_config: Optional[Dict[str, Any]] = None):
+        # 修复: 在调用父类__init__前，先进行量化模型转换
+        # 这样ExportWrapper接收的是转换后的模型，避免FakeQuantizer包装冲突
         self.opset_version = opset_version
+        self.quantization_config = quantization_config or {}
+        self._quantization_applied = False
+        
+        # 提前进行量化转换（如果启用）
+        converted_model = self._convert_model_if_quantized(model)
+        
+        # 现在调用父类__init__，传入可能已转换的模型
+        super().__init__(converted_model, output_dir, vocab, other_pad_size, blank_id, sos_id, eos_id, idx2char)
+
+    def _convert_model_if_quantized(self, model: nn.Module) -> nn.Module:
+        """在初始化时转换量化模型
+        
+        修复模型转换时机问题：在ONNXExporter创建时就完成转换，
+        而不是等到export()时才转换，确保ExportWrapper接收正确的模型
+        """
+        if not self.quantization_config.get('enabled', False):
+            return model
+        
+        # 检查是否已经是真量化模型
+        if self._is_true_quantized_model(model):
+            logger.info("✅ 模型已经是真量化模型，跳过转换")
+            return model
+        
+        # 检查是否是QAT模型需要转换
+        if self._is_qat_model(model):
+            logger.info("🔄 ONNXExporter: 检测到QAT模型，开始转换为真量化模型...")
+            try:
+                converted = self._convert_qat_to_quantized(model)
+                self._quantization_applied = True
+                logger.info("✅ 量化模型转换完成，将使用转换后的模型进行导出")
+                return converted
+            except Exception as e:
+                logger.warning(f"⚠️ 量化模型转换失败，使用原始模型: {e}")
+                return model
+        
+        return model
 
     def export(self, dummy_input: torch.Tensor,
                input_names: Optional[List[str]] = None,
@@ -186,7 +251,7 @@ class ONNXExporter(ModelExporter):
             output_names = ['logits']
         if dynamic_axes is None:
             # 给每个动态维起名字 + 可选范围
-            batch_size  = Dim("batch_size", min=2, max=1024)   # 可写 Dim("batch", min=1, max=64)
+            batch_size  = Dim("batch_size", min=2, max=1024)
             width       = Dim("width", min=16, max=4096)
             dynamic_axes = {
                 "x":   {0: batch_size, 3: width}
@@ -201,9 +266,12 @@ class ONNXExporter(ModelExporter):
         # 导出ONNX
         try:
             with torch.no_grad():
-                self.model(dummy_input)
+                # 检查并应用量化转换（伪量化->真量化）
+                model_to_export = self._prepare_model_for_export(dummy_input)
+                
+                model_to_export(dummy_input)
                 if not os.path.exists(output_path):
-                    self.export_onnx(str(output_path), dummy_input, input_names, output_names, dynamic_axes)
+                    self.export_onnx(str(output_path), dummy_input, input_names, output_names, dynamic_axes, model_to_export)
                 self.validate(str(output_path), self.vocab, self.other_pad_size, self.blank_id, self.sos_id, self.eos_id, self.idx2char)
 
             logger.info(f"✅ ONNX模型导出成功: {output_path}")
@@ -245,24 +313,337 @@ class ONNXExporter(ModelExporter):
             logger.error(f"❌ ONNX模型验证失败: {e}")
             return False
 
+    def _prepare_model_for_export(self, dummy_input: torch.Tensor) -> nn.Module:
+        """
+        准备模型用于导出，将伪量化(QAT)转换为真量化
+        
+        Args:
+            dummy_input: 示例输入，用于模型追踪
+            
+        Returns:
+            转换后的模型（如果启用了量化）
+        """
+        model = self.model
+        
+        # 检查是否启用了量化
+        if not self.quantization_config.get('enabled', False):
+            logger.info("📋 量化未启用，直接导出原始模型")
+            return model
+        
+        # 检查是否已经是真量化模型（通过检查权重数据类型）
+        if self._is_true_quantized_model(model):
+            logger.info("✅ 模型已经是真量化模型，直接导出")
+            return model
+        
+        # 检查是否是QAT模型（包含伪量化节点）
+        if self._is_qat_model(model):
+            logger.info("🔄 检测到QAT伪量化模型，开始转换为真量化...")
+            model = self._convert_qat_to_quantized(model)
+            self._quantization_applied = True
+        
+        return model
+    
+    def _is_qat_model(self, model: nn.Module) -> bool:
+        """
+        检查模型是否是QAT模型（包含伪量化节点）
+        
+        支持检测:
+        - 旧版API: Int8DynActInt4WeightQATQuantizer 等
+        - 新版API: FakeQuantizer (FakeQuantizeConfig)
+        
+        Returns:
+            True 如果模型包含QAT相关的伪量化节点
+        """
+        # 检查模型本身是否是 FakeQuantizer (新版API)
+        model_class = model.__class__.__name__
+        if 'FakeQuantizer' in model_class:
+            return True
+        
+        # 如果是 ExportWrapper，检查其子模块
+        if hasattr(model, 'get_submodules'):
+            submodules = model.get_submodules()
+            for submodule in submodules.values():
+                if submodule is not None and self._is_qat_model(submodule):
+                    return True
+            return False
+        
+        # 检查普通模型
+        for name, module in model.named_modules():
+            # 检查 torchao QAT 量化器添加的伪量化节点
+            module_class = module.__class__.__name__
+            if any(keyword in module_class.lower() for keyword in [
+                'qat', 'fakequantize', 'fake_quant', 'int8dynactint4weight',
+                'int4weightonly', 'quantizedlinear', '_quantize',
+                'fakequantizer',  # 新版API: FakeQuantizer
+            ]):
+                return True
+            # 检查是否有量化相关的属性
+            if hasattr(module, 'weight_scale') or hasattr(module, 'weight_zero_point'):
+                return True
+            if hasattr(module, 'activation_scale') or hasattr(module, 'activation_zero_point'):
+                return True
+        return False
+    
+    def _is_modern_api_qat_model(self, model: nn.Module) -> bool:
+        """
+        检查模型是否是新版API (FakeQuantizeConfig) 的QAT模型
+        
+        Returns:
+            True 如果模型使用新版QAT API (FakeQuantizer)
+        """
+        # 检查模型本身
+        if 'FakeQuantizer' in model.__class__.__name__:
+            return True
+        
+        # 检查子模块
+        for name, module in model.named_modules():
+            if 'FakeQuantizer' in module.__class__.__name__:
+                return True
+        
+        return False
+    
+    def _is_true_quantized_model(self, model: nn.Module) -> bool:
+        """
+        检查模型是否已经是真量化模型（权重为整数类型）
+        
+        Returns:
+            True 如果模型权重已经是整数类型
+        """
+        # 如果是 ExportWrapper，检查其子模块
+        if hasattr(model, 'get_submodules'):
+            submodules = model.get_submodules()
+            for submodule in submodules.values():
+                if submodule is not None and self._is_true_quantized_model(submodule):
+                    return True
+            return False
+        
+        # 检查普通模型
+        for param in model.parameters():
+            if param.dtype in [torch.qint8, torch.quint8, torch.qint32, torch.int8, torch.uint8]:
+                return True
+        return False
+    
+    def _convert_qat_to_quantized(self, model: nn.Module) -> nn.Module:
+        """
+        将QAT伪量化模型转换为真量化模型
+        
+        支持两种API:
+        - 新版API (FakeQuantizeConfig): 使用 from_intx_quantization_aware_training
+        - 旧版API (Int8DynActInt4WeightQATQuantizer): 使用 quantize_
+        
+        修复: 正确处理ExportWrapper，确保转换后返回新的模型实例，避免引用丢失
+        
+        Args:
+            model: QAT训练后的模型（可能是 ExportWrapper 或 FakeQuantizer）
+            
+        Returns:
+            转换后的真量化模型
+        """
+        try:
+            import copy
+            
+            # 检测是否是新版API的FakeQuantizer模型
+            is_modern_api = self._is_modern_api_qat_model(model)
+            
+            if is_modern_api:
+                # 新版API: 使用 QATConfig 转换 (step="convert")
+                logger.info("🔄 检测到新版QAT API，使用 QATConfig(step='convert') 转换...")
+                
+                try:
+                    from torchao.quantization import quantize_
+                    from torchao.quantization.qat import QATConfig
+                    
+                    # 处理 FakeQuantizer 包装的模型 - 先解包获取真实模型
+                    inner_model = model
+                    if hasattr(model, 'model') and 'FakeQuantizer' in model.__class__.__name__:
+                        inner_model = model.model
+                        logger.info("🔓 解包 FakeQuantizer 获取原始模型")
+                    
+                    # 创建转换配置 (step="convert" 用于将 fake quant 转换为真实量化)
+                    # 新API: 使用 QATConfig(step="convert") 自动推断之前的配置
+                    convert_config = QATConfig(step="convert")
+                    
+                    # 对于 ExportWrapper，需要分别转换子模块
+                    if hasattr(inner_model, 'get_submodules'):
+                        logger.info("📝 检测到包装器模型，对子模块进行转换...")
+                        submodules = inner_model.get_submodules()
+                        
+                        for name, submodule in submodules.items():
+                            if submodule is not None and self._is_modern_api_qat_model(submodule):
+                                try:
+                                    # 使用 quantize_ 进行 in-place 转换
+                                    quantize_(submodule, convert_config)
+                                    logger.info(f"  ✅ {name} 转换完成")
+                                except Exception as sub_err:
+                                    logger.warning(f"  ⚠️ {name} 转换失败: {sub_err}，使用原始子模块")
+                        
+                        model_to_return = inner_model
+                    else:
+                        # 普通模型直接转换 - quantize_ 是 in-place 操作
+                        quantize_(inner_model, convert_config)
+                        model_to_return = inner_model
+                    
+                    logger.info("✅ 新版QAT模型已成功转换为真量化模型")
+                    
+                    # 验证转换结果
+                    self._verify_quantization(model_to_return)
+                    
+                    return model_to_return
+                    
+                except ImportError as import_err:
+                    logger.error(f"❌ 无法导入 QATConfig: {import_err}")
+                    logger.warning("⚠️ 新版API转换失败，尝试使用旧版方法...")
+                    # 继续执行旧版转换逻辑
+            
+            # 旧版API: 使用 quantize_ 进行转换 (PTQ)
+            logger.info("🔄 使用PTQ API转换 (quantize_)...")
+            
+            from torchao.quantization import (
+                quantize_,
+                Int8DynamicActivationIntxWeightConfig,
+                IntxWeightOnlyConfig,
+            )
+            
+            # 获取量化策略
+            strategy = self.quantization_config.get('quantization_strategy', 'int8_dyn_act_int4_weight')
+            
+            logger.info(f"🎯 应用量化策略: {strategy}")
+            
+            # 根据策略选择量化器 - 使用新版API
+            if strategy == 'int8_dyn_act_int4_weight':
+                quantizer = Int8DynamicActivationIntxWeightConfig(
+                    weight_dtype=torch.int4,
+                    group_size=32,
+                )
+            elif strategy == 'int8_weight_only':
+                quantizer = IntxWeightOnlyConfig(
+                    weight_dtype=torch.int8,
+                )
+            elif strategy == 'int4_weight_only':
+                quantizer = IntxWeightOnlyConfig(
+                    weight_dtype=torch.int4,
+                    group_size=32,
+                )
+            elif strategy == 'int8_dynamic_activation_int8_weight':
+                quantizer = Int8DynamicActivationIntxWeightConfig(
+                    weight_dtype=torch.int8,
+                )
+            else:
+                logger.warning(f"⚠️ 未知的量化策略: {strategy}，使用默认策略")
+                quantizer = Int8DynamicActivationIntxWeightConfig(
+                    weight_dtype=torch.int4,
+                    group_size=32,
+                )
+            
+            # 处理 FakeQuantizer 包装的模型
+            inner_model = model
+            if hasattr(model, 'model') and 'FakeQuantizer' in model.__class__.__name__:
+                inner_model = model.model
+                logger.info("🔓 解包 FakeQuantizer 获取原始模型")
+            
+            # 检查是否是 ExportWrapper
+            is_wrapper = hasattr(inner_model, 'get_submodules')
+            
+            if is_wrapper:
+                # 对于 ExportWrapper，我们需要对其子模块进行量化
+                logger.info("📝 检测到包装器模型，对子模块进行量化...")
+                submodules = inner_model.get_submodules()
+                
+                # 对每个子模块应用量化
+                for name, submodule in submodules.items():
+                    if submodule is not None:
+                        try:
+                            quantize_(submodule, quantizer())
+                            logger.info(f"  ✅ {name} 量化完成")
+                        except Exception as sub_err:
+                            logger.warning(f"  ⚠️ {name} 量化失败: {sub_err}")
+                
+                model_to_return = model
+            else:
+                # 对于普通模型，使用深拷贝并应用量化
+                try:
+                    model_copy = copy.deepcopy(model)
+                except Exception as copy_err:
+                    logger.warning(f"⚠️ 深拷贝失败: {copy_err}，将直接修改原模型")
+                    model_copy = model
+                
+                model_copy.eval()
+                
+                # 应用真量化
+                quantize_(model_copy, quantizer())
+                model_to_return = model_copy
+            
+            logger.info("✅ 旧版QAT模型已成功转换为真量化模型")
+            
+            # 验证转换结果
+            self._verify_quantization(model_to_return)
+            
+            return model_to_return
+            
+        except Exception as e:
+            logger.warning(f"⚠️ 量化转换失败: {e}，将导出原始模型")
+            import traceback
+            logger.debug(f"错误详情: {traceback.format_exc()}")
+            return model
+    
+    def _verify_quantization(self, model: nn.Module):
+        """验证模型是否成功量化"""
+        quantized_layers = 0
+        total_layers = 0
+        
+        # 如果是 ExportWrapper，检查其子模块
+        if hasattr(model, 'get_submodules'):
+            submodules = model.get_submodules()
+            for submodule in submodules.values():
+                if submodule is not None:
+                    q, t = self._count_quantized_layers(submodule)
+                    quantized_layers += q
+                    total_layers += t
+        else:
+            q, t = self._count_quantized_layers(model)
+            quantized_layers += q
+            total_layers += t
+        
+        if total_layers > 0:
+            ratio = quantized_layers / total_layers * 100
+            logger.info(f"📊 量化覆盖率: {quantized_layers}/{total_layers} 层 ({ratio:.1f}%)")
+    
+    def _count_quantized_layers(self, model: nn.Module) -> tuple:
+        """统计模型的量化层数"""
+        quantized_layers = 0
+        total_layers = 0
+        
+        for name, module in model.named_modules():
+            module_class = module.__class__.__name__.lower()
+            if 'linear' in module_class or 'conv' in module_class:
+                total_layers += 1
+                # 检查是否是量化层
+                if any(keyword in module_class for keyword in ['quantized', 'int8', 'int4']):
+                    quantized_layers += 1
+        
+        return quantized_layers, total_layers
+    
     def export_onnx(self, onnx_path: str, dummy_input: torch.Tensor,
                     input_names: List[str],
                     output_names: List[str],
-                    dynamic_shapes: Dict[str, Dict[int, Dim]]):
+                    dynamic_shapes: Dict[str, Dict[int, Dim]],
+                    model_to_export: Optional[nn.Module] = None):
         """导出 Onnx 模型"""
+        
+        # 使用传入的模型或默认模型
+        model = model_to_export if model_to_export is not None else self.model
 
         # 给每个动态维起名字 + 可选范围
-        batch_size  = Dim("batch_size", min=2, max=1024)   # 可写 Dim("batch", min=1, max=64)
+        batch_size  = Dim("batch_size", min=2, max=1024)
         width       = Dim("width", min=16, max=4096)
 
         # 把输出也当关键字写进去（名字跟 forward 返回变量对应）
-        # 输出张量不需要写在这里，Dynamo 会推导；如果写了会导致出错
         dynamic_shapes = {
             "x":   {0: batch_size, 3: width}
         }
 
         torch.onnx.export(
-            self.model,
+            model,
             args=dummy_input,
             f=onnx_path,
             dynamo=True,
@@ -841,7 +1222,8 @@ class QuantizedModelExporter:
 
         # 初始化所有导出器
         self.exporters = {
-            'onnx': ONNXExporter(model, str(self.output_dir / 'onnx'), vocab, other_pad_size, blank_id, sos_id, eos_id, idx2char),
+            'onnx': ONNXExporter(model, str(self.output_dir / 'onnx'), vocab, other_pad_size, blank_id, sos_id, eos_id, idx2char, 
+                                quantization_config=self.quantization_config),
             'torchscript': TorchScriptExporter(model, str(self.output_dir / 'torchscript'), vocab, other_pad_size, blank_id, sos_id, eos_id, idx2char),
             'tensorrt': TensorRTExporter(model, str(self.output_dir / 'tensorrt'), vocab, other_pad_size, blank_id, sos_id, eos_id, idx2char),
             'coreml': CoreMLExporter(model, str(self.output_dir / 'coreml'), vocab, other_pad_size, blank_id, sos_id, eos_id, idx2char),
