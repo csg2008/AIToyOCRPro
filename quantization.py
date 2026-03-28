@@ -26,20 +26,17 @@ from functools import reduce
 import operator
 import itertools
 import warnings
-import copy  # 用于深拷贝原始模型
-import random  # 用于随机搜索优化
+import copy
+import random
 from torchao.quantization import (
     quantize_,
-    # 新版PTQ API (torchao 0.16.0)
     Int8DynamicActivationIntxWeightConfig,
     IntxWeightOnlyConfig,
 )
 from torchao.quantization.qat import (
-    # 新版QAT API - 使用新的推荐API (torchao 0.16.0)
     ComposableQATQuantizer,
     QATConfig,
-    # 新版配置直接导入
-    IntxFakeQuantizeConfig,  # 注意是小写x
+    IntxFakeQuantizeConfig,
 )
 from torchao.quantization.qat.linear import FakeQuantizedLinear
 from torchao.quantization.granularity import PerTensor, PerGroup, PerToken, PerRow, PerBlock, PerAxis
@@ -86,7 +83,7 @@ class PruningConfig:
         }
 
 class PruningManager:
-    """剪枝管理器"""
+    """剪枝管理器 - 处理结构化/非结构化剪枝、验证和回滚"""
     def __init__(self, config: PruningConfig, model: nn.Module):
         self.config = config
         self.model = model
@@ -94,6 +91,9 @@ class PruningManager:
         self.original_model = None
         self.pruning_applied = False
         self.pruning_candidates = {}
+        # 缓存第一层名称，避免重复计算
+        self._first_layer_name = None
+        self._sensitivity_analysis = {}
 
     def get_pruning_ratio(self, layer_name: str) -> float:
         """获取特定层的剪枝比例"""
@@ -102,17 +102,107 @@ class PruningManager:
                 return ratio
         return self.config.pruning_ratio
 
-    def record_pruning_candidates(self, epoch: int, current_acc: float, best_acc: float) -> bool:
-        """记录剪枝候选节点"""
+    def _is_first_layer(self, module: nn.Module, name: str) -> bool:
+        """检测是否为网络的第一层
+
+        通过遍历模型结构来确定第一层，而不是依赖硬编码的命名模式
+        """
+        if self._first_layer_name is not None:
+            return name == self._first_layer_name
+
+        # 找到第一个卷积层或线性层
+        for n, m in self.model.named_modules():
+            if isinstance(m, (nn.Conv2d, nn.Linear)):
+                self._first_layer_name = n
+                return n == name
+        return False
+
+    def _is_excluded_layer(self, module: nn.Module, name: str) -> bool:
+        """判断是否应该排除该层不剪枝"""
+        # 第一层通常不剪枝（特别是输入通道）
+        if self._is_first_layer(module, name):
+            return True
+
+        # 分类层/输出层保护
+        if any(keyword in name.lower() for keyword in ['classifier', 'head', 'output', 'fc_out']):
+            if isinstance(module, nn.Linear) and module.out_features < 1000:
+                return True
+
+        # 检查是否在允许的剪枝层列表中
+        if not any(layer_type in name for layer_type in self.config.pruning_layers):
+            return True
+
+        return False
+
+    def _is_prunable_module(self, module: nn.Module, name: str) -> bool:
+        """判断模块是否可剪枝"""
+        if not isinstance(module, (nn.Conv2d, nn.Linear)):
+            return False
+
+        if self._is_excluded_layer(module, name):
+            return False
+
+        # 检查权重是否足够大（避免剪枝极小的层）
+        if module.weight.numel() < 100:  # 小于100参数的层不剪枝
+            return False
+
+        return True
+
+    def _clear_all_pruning_masks(self):
+        """清除模型中所有残留的剪枝 mask
+        
+        改进: 使用 prune.remove() 和 prune.is_pruned() 标准API，
+        避免直接操作属性导致的状态不一致
+        """
+        cleared_count = 0
+        for name, module in self.model.named_modules():
+            # 使用标准API检查是否已剪枝，而不是检查属性
+            if not prune.is_pruned(module):
+                continue
+                
+            for param_name in ['weight', 'bias']:
+                mask_attr = f'{param_name}_mask'
+                
+                # 只有当mask属性存在时才处理
+                if not hasattr(module, mask_attr):
+                    continue
+                    
+                try:
+                    # 使用标准API移除剪枝，这会正确处理原始参数
+                    prune.remove(module, param_name)
+                    cleared_count += 1
+                except (ValueError, AttributeError) as e:
+                    # 如果移除失败（例如参数不存在），安全地清理mask
+                    try:
+                        mask = getattr(module, mask_attr)
+                        if hasattr(module, param_name):
+                            param = getattr(module, param_name)
+                            # 将mask应用到参数，确保0值被保留
+                            with torch.no_grad():
+                                param.data = param.data * mask
+                    except Exception:
+                        pass
+        
+        # 清理pruned_layers列表中的记录
+        self.pruned_layers = []
+        self.pruning_applied = False
+        if cleared_count > 0:
+            print(f"   已清除 {cleared_count} 个参数的剪枝状态")
+
+    def _should_prune(self, epoch: int, current_acc: float, best_acc: float) -> bool:
+        """检查是否应该进行剪枝"""
         if not self.config.enabled:
             return False
-
-        # 检查是否达到剪枝条件
         if epoch != self.config.pruning_epoch:
             return False
+        if current_acc < best_acc * (1 - self.config.min_acc_drop):
+            print(f"⚠️ 当前精度 {current_acc:.4f} 低于阈值 {best_acc * (1 - self.config.min_acc_drop):.4f}，跳过剪枝")
+            return False
+        return True
 
-        # 检查精度是否足够高
-        if current_acc < best_acc * 0.95:
+    def record_pruning_candidates(self, epoch: int, current_acc: float, best_acc: float) -> bool:
+        """记录剪枝候选节点"""
+        if not self._should_prune(epoch, current_acc, best_acc):
             return False
 
         print(f"🎯 开始记录剪枝候选节点...")
@@ -120,84 +210,119 @@ class PruningManager:
         print(f"   - 最佳精度: {best_acc:.4f}")
         print(f"   - 剪枝策略: {self.config.pruning_strategy}")
 
+        # 梯度剪枝警告与验证
+        if self.config.prune_criteria == 'grad':
+            was_training = self.model.training
+            has_grad = False
+
+            # 先在训练模式下检查
+            self.model.train()
+            for _, module in self.model.named_modules():
+                if isinstance(module, (nn.Conv2d, nn.Linear)):
+                    if module.weight.grad is not None:
+                        has_grad = True
+                        break
+
+            # 恢复原始模式
+            if not was_training:
+                self.model.eval()
+
+            if not has_grad:
+                print("⚠️ 警告: 使用梯度剪枝标准但模型没有梯度信息")
+                print("   梯度剪枝需要在反向传播之后、梯度清零之前执行")
+                print("   建议: 在训练步骤(loss.backward后, optimizer.zero_grad前)调用record_pruning_candidates")
+                print("   当前将回退到L1范数剪枝标准")
+
         # 遍历模型的所有层
         for name, module in self.model.named_modules():
-            # 只考虑卷积层和全连接层
-            if isinstance(module, (nn.Conv2d, nn.Linear)):
-                # 检查是否在指定的剪枝层中
-                if any(layer_type in name for layer_type in self.config.pruning_layers):
-                    pruning_ratio = self.get_pruning_ratio(name)
-                    print(f"   - 记录层: {name}, 剪枝比例: {pruning_ratio:.2f}")
+            if not self._is_prunable_module(module, name):
+                continue
 
-                    # 获取权重
-                    weight = module.weight.data.cpu()
+            pruning_ratio = self.get_pruning_ratio(name)
+            print(f"   - 记录层: {name}, 剪枝比例: {pruning_ratio:.2f}")
 
-                    # 根据剪枝标准计算权重重要性
-                    if self.config.prune_criteria == 'l1':
-                        # L1范数
-                        importance = torch.abs(weight)
-                    elif self.config.prune_criteria == 'l2':
-                        # L2范数
-                        importance = torch.norm(weight, dim=-1)
-                    elif self.config.prune_criteria == 'grad':
-                        # 梯度信息（如果可用）
-                        if module.weight.grad is not None:
-                            importance = torch.abs(module.weight.grad.data.cpu())
-                        else:
-                            importance = torch.abs(weight)
-                    else:
-                        # 默认使用L1范数
-                        importance = torch.abs(weight)
+            # 获取权重
+            weight = module.weight.data.cpu()
 
-                    # 根据剪枝策略确定剪枝方式
-                    if self.config.pruning_strategy == 'l1_unstructured':
-                        # 非结构化剪枝：按权重值排序
-                        flat_importance = importance.flatten()
-                        threshold = torch.quantile(flat_importance, pruning_ratio)
-                        mask = importance > threshold
-                    else:
-                        # 结构化剪枝：按通道或神经元排序
-                        if isinstance(module, nn.Conv2d):
-                            # 卷积层按输出通道排序
-                            channel_importance = importance.view(importance.size(0), -1).mean(dim=1)
-                        else:
-                            # 全连接层按输出神经元排序
-                            channel_importance = importance.view(importance.size(0), -1).mean(dim=1)
+            # 根据剪枝标准计算权重重要性
+            importance = self._calculate_importance(module, weight)
 
-                        num_channels = len(channel_importance)
-                        num_prune = int(num_channels * pruning_ratio)
-                        sorted_indices = torch.argsort(channel_importance)
-                        prune_indices = sorted_indices[:num_prune]
+            # 根据剪枝策略确定剪枝方式
+            if self.config.pruning_strategy == 'l1_unstructured':
+                # 非结构化剪枝：按权重值排序
+                flat_importance = importance.flatten()
+                threshold = torch.quantile(flat_importance, pruning_ratio)
+                mask = importance > threshold
+            else:
+                # 结构化剪枝：按通道或神经元排序
+                mask = self._create_structured_mask(module, importance, pruning_ratio)
 
-                        # 创建掩码
-                        mask = torch.ones_like(weight)
-                        if isinstance(module, nn.Conv2d):
-                            mask[prune_indices, :, :, :] = 0
-                        else:
-                            mask[prune_indices, :] = 0
+            # 存储剪枝候选信息
+            self.pruning_candidates[name] = {
+                'module_type': module.__class__.__name__,
+                'pruning_ratio': pruning_ratio,
+                'mask': mask,
+                'importance': importance
+            }
 
-                    # 存储剪枝候选信息
-                    self.pruning_candidates[name] = {
-                        'module_type': module.__class__.__name__,
-                        'pruning_ratio': pruning_ratio,
-                        'mask': mask,
-                        'importance': importance
-                    }
-
-        print(f"✅ 剪枝候选节点记录完成")
+        print(f"✅ 剪枝候选节点记录完成 (共 {len(self.pruning_candidates)} 层)")
         return True
 
+    def _calculate_importance(self, module: nn.Module, weight: torch.Tensor) -> torch.Tensor:
+        """计算权重重要性"""
+        criteria = self.config.prune_criteria
+        weight_device = weight.device
+
+        if criteria == 'l1':
+            return torch.abs(weight)
+        elif criteria == 'l2':
+            return torch.norm(weight.view(weight.size(0), -1), dim=1, keepdim=True).view_as(weight)
+        elif criteria == 'grad':
+            if module.weight.grad is not None:
+                # 确保梯度在与 weight 相同的设备上
+                grad = module.weight.grad.data
+                if grad.device != weight_device:
+                    grad = grad.to(weight_device)
+                return torch.abs(grad)
+            else:
+                # 无梯度时回退到 L1
+                return torch.abs(weight)
+        else:
+            return torch.abs(weight)
+
+    def _create_structured_mask(self, module: nn.Module, importance: torch.Tensor,
+                                 pruning_ratio: float) -> torch.Tensor:
+        """创建结构化剪枝的mask"""
+        device = importance.device
+
+        # 按输出通道/神经元计算重要性
+        channel_importance = importance.view(importance.size(0), -1).mean(dim=1)
+
+        num_channels = len(channel_importance)
+        num_prune = int(num_channels * pruning_ratio)
+
+        if num_prune <= 0 or num_prune >= num_channels:
+            # 如果没有需要pruning的通道，返回全1 mask
+            return torch.ones_like(importance)
+
+        sorted_indices = torch.argsort(channel_importance)
+        prune_indices = sorted_indices[:num_prune]
+
+        # 创建掩码 - 在与 importance 相同的设备上
+        mask = torch.ones_like(importance)
+
+        # 对于 Conv2d 和 Linear，都pruning输出维度
+        if isinstance(module, (nn.Conv2d, nn.Linear)):
+            mask[prune_indices] = 0
+
+        return mask
+
     def apply_pruning(self, epoch: int, current_acc: float, best_acc: float) -> bool:
-        """应用剪枝"""
-        if not self.config.enabled:
-            return False
+        """应用剪枝 - 统一入口
 
-        # 检查是否达到剪枝条件
-        if epoch != self.config.pruning_epoch:
-            return False
-
-        # 检查精度是否足够高
-        if current_acc < best_acc * 0.95:
+        统一使用 _apply_pruning_to_module 方法，消除代码重复
+        """
+        if not self._should_prune(epoch, current_acc, best_acc):
             return False
 
         print(f"🎯 开始剪枝...")
@@ -205,65 +330,140 @@ class PruningManager:
         print(f"   - 最佳精度: {best_acc:.4f}")
         print(f"   - 剪枝策略: {self.config.pruning_strategy}")
 
-        # 保存原始模型
-        self.original_model = self.model.state_dict()
+        # 保存原始模型（深拷贝以避免引用问题）
+        self.original_model = copy.deepcopy(self.model.state_dict())
 
-        # 应用剪枝
-        if self.config.pruning_strategy == 'l1_unstructured':
-            self._apply_l1_unstructured_pruning()
-        elif self.config.pruning_strategy == 'l1_structured':
-            self._apply_l1_structured_pruning()
-        elif self.config.pruning_strategy == 'ln_structured':
-            self._apply_ln_structured_pruning()
+        # 清除任何之前的剪枝状态
+        self._clear_all_pruning_masks()
+
+        # 统一应用剪枝
+        pruned_count = 0
+        for name, module in self.model.named_modules():
+            if not self._is_prunable_module(module, name):
+                continue
+
+            pruning_ratio = self.get_pruning_ratio(name)
+            if pruning_ratio <= 0 or pruning_ratio >= 1:
+                continue
+
+            if self._apply_pruning_to_module(module, name, pruning_ratio):
+                print(f"   - 剪枝层: {name}, 比例: {pruning_ratio:.2%}")
+                pruned_count += 1
 
         self.pruning_applied = True
-        print(f"✅ 剪枝完成")
+        print(f"✅ 剪枝完成 (共 {pruned_count} 层)")
         return True
 
-    def _apply_l1_unstructured_pruning(self):
-        """应用L1非结构化剪枝"""
-        # 遍历模型的所有层
+    def _apply_pruning_to_module(self, module: nn.Module, name: str,
+                                  pruning_ratio: float) -> bool:
+        """统一应用剪枝到单个模块
+
+        Args:
+            module: 要剪枝的模块
+            name: 模块名称
+            pruning_ratio: 剪枝比例
+
+        Returns:
+            是否成功应用剪枝
+        """
+        if pruning_ratio <= 0 or pruning_ratio >= 1:
+            return False
+
+        strategy = self.config.pruning_strategy
+
+        try:
+            if strategy == 'l1_unstructured':
+                prune.l1_unstructured(module, name='weight', amount=pruning_ratio)
+
+            elif strategy == 'l1_structured':
+                dim = self._select_pruning_dim(module, name)
+                prune.ln_structured(module, name='weight', amount=pruning_ratio, n=1, dim=dim)
+
+            elif strategy == 'l2_structured':
+                dim = self._select_pruning_dim(module, name)
+                prune.ln_structured(module, name='weight', amount=pruning_ratio, n=2, dim=dim)
+
+            elif strategy == 'ln_structured':
+                # 使用配置中的参数
+                n = self.config.prune_params.get('n', 2)
+                dim = self._select_pruning_dim(module, name)
+                prune.ln_structured(module, name='weight', amount=pruning_ratio, n=n, dim=dim)
+            else:
+                print(f"⚠️ 未知的剪枝策略: {strategy}，跳过层 {name}")
+                return False
+
+            # 记录已剪枝的层
+            if (name, module) not in self.pruned_layers:
+                self.pruned_layers.append((name, module))
+
+            return True
+
+        except Exception as e:
+            print(f"⚠️ 剪枝层 {name} 失败: {e}")
+            return False
+
+    def apply_global_pruning(self, epoch: int, current_acc: float, best_acc: float) -> bool:
+        """全局非结构化剪枝 - 获得更好的整体稀疏性
+
+        相比逐层剪枝，全局剪枝可以在全局范围内选择最不重要的权重，
+        从而获得更优的稀疏模式。
+
+        Args:
+            epoch: 当前epoch
+            current_acc: 当前精度
+            best_acc: 最佳精度
+
+        Returns:
+            是否成功应用剪枝
+        """
+        if not self._should_prune(epoch, current_acc, best_acc):
+            return False
+
+        print(f"🎯 开始全局剪枝...")
+        print(f"   - 当前精度: {current_acc:.4f}")
+        print(f"   - 最佳精度: {best_acc:.4f}")
+        print(f"   - 目标剪枝比例: {self.config.pruning_ratio:.2%}")
+
+        # 保存原始模型
+        self.original_model = copy.deepcopy(self.model.state_dict())
+        self._clear_all_pruning_masks()
+
+        # 收集所有可剪枝的参数
+        parameters_to_prune = []
         for name, module in self.model.named_modules():
-            # 只剪枝卷积层和全连接层
-            if isinstance(module, (nn.Conv2d, nn.Linear)):
-                # 检查是否在指定的剪枝层中
-                if any(layer_type in name for layer_type in self.config.pruning_layers):
-                    pruning_ratio = self.get_pruning_ratio(name)
-                    print(f"   - 剪枝层: {name}, 剪枝比例: {pruning_ratio:.2f}")
+            if self._is_prunable_module(module, name):
+                parameters_to_prune.append((module, 'weight'))
 
-                    # 应用L1非结构化剪枝
-                    prune.l1_unstructured(module, name='weight', amount=pruning_ratio)
-                    self.pruned_layers.append((name, module))
+        if len(parameters_to_prune) == 0:
+            print("⚠️ 没有可剪枝的层")
+            return False
 
-    def _apply_l1_structured_pruning(self):
-        """应用L1结构化剪枝"""
-        # 遍历模型的所有层
-        for name, module in self.model.named_modules():
-            # 只剪枝卷积层和全连接层
-            if isinstance(module, (nn.Conv2d, nn.Linear)):
-                # 检查是否在指定的剪枝层中
-                if any(layer_type in name for layer_type in self.config.pruning_layers):
-                    pruning_ratio = self.get_pruning_ratio(name)
-                    print(f"   - 剪枝层: {name}, 剪枝比例: {pruning_ratio:.2f}")
+        try:
+            # 应用全局剪枝
+            prune.global_unstructured(
+                parameters_to_prune,
+                pruning_method=prune.L1Unstructured,
+                amount=self.config.pruning_ratio
+            )
 
-                    # 应用L1结构化剪枝
-                    prune.ln_structured(module, name='weight', amount=pruning_ratio, n=1, dim=0)
-                    self.pruned_layers.append((name, module))
+            # 记录已剪枝的层
+            for module, _ in parameters_to_prune:
+                for m_name, m in self.model.named_modules():
+                    if m is module and (m_name, module) not in self.pruned_layers:
+                        self.pruned_layers.append((m_name, module))
+                        break
 
-    def _apply_ln_structured_pruning(self):
-        """应用LN结构化剪枝"""
-        # 遍历模型的所有层
-        for name, module in self.model.named_modules():
-            # 只剪枝卷积层和全连接层
-            if isinstance(module, (nn.Conv2d, nn.Linear)):
-                # 检查是否在指定的剪枝层中
-                if any(layer_type in name for layer_type in self.config.pruning_layers):
-                    pruning_ratio = self.get_pruning_ratio(name)
-                    print(f"   - 剪枝层: {name}, 剪枝比例: {pruning_ratio:.2f}")
+            self.pruning_applied = True
+            actual_ratio = self.calculate_pruning_ratio()
+            print(f"✅ 全局剪枝完成，实际比例: {actual_ratio:.2%}")
+            return True
 
-                    # 应用LN结构化剪枝
-                    prune.ln_structured(module, name='weight', amount=pruning_ratio, **self.config.prune_params)
-                    self.pruned_layers.append((name, module))
+        except Exception as e:
+            print(f"❌ 全局剪枝失败: {e}")
+            # 回滚
+            if self.original_model is not None:
+                self.model.load_state_dict(self.original_model)
+            return False
 
     def apply_pruning_from_candidates(self) -> bool:
         """从记录的候选节点应用剪枝"""
@@ -273,31 +473,76 @@ class PruningManager:
         print(f"🎯 开始从候选节点应用剪枝...")
         print(f"   - 剪枝候选节点数量: {len(self.pruning_candidates)}")
 
-        # 保存原始模型
-        self.original_model = self.model.state_dict()
+        # 保存原始模型（深拷贝）
+        self.original_model = copy.deepcopy(self.model.state_dict())
+
+        # 清除之前的状态
+        self._clear_all_pruning_masks()
 
         # 遍历候选节点并应用剪枝
+        applied_count = 0
+        failed_count = 0
         for name, info in self.pruning_candidates.items():
             # 查找对应模块
             module = self._get_module_by_name(name)
             if module is None:
                 print(f"⚠️  未找到模块: {name}")
+                failed_count += 1
                 continue
 
-            print(f"   - 应用剪枝到层: {name}, 剪枝比例: {info['pruning_ratio']:.2f}")
+            # 验证模块类型
+            if not isinstance(module, (nn.Conv2d, nn.Linear)):
+                print(f"[WARN]  模块 {name} 不是可pruninglayer，跳过")
+                failed_count += 1
+                continue
 
             # 获取掩码
-            mask = info['mask'].to(module.weight.device)
+            mask = info['mask']
 
-            # 应用掩码到权重
-            with torch.no_grad():
-                module.weight.data *= mask
+            # 验证 mask 形状
+            if mask.shape != module.weight.shape:
+                print(f"⚠️  mask 形状不匹配 {name}: {mask.shape} vs {module.weight.shape}")
+                failed_count += 1
+                continue
 
-            # 记录剪枝后的层
-            self.pruned_layers.append((name, module))
+            # 将 mask 移动到正确的设备
+            mask = mask.to(module.weight.device)
 
-        self.pruning_applied = True
-        print(f"✅ 剪枝应用完成")
+            try:
+                # 使用 PyTorch 标准 API 应用pruning mask
+                # 这会正确注册 mask，与 make_pruning_permanent 兼容
+                prune.custom_from_mask(module, name='weight', mask=mask)
+
+                # 对于结构化pruning（通道级），调整偏置
+                if module.bias is not None and mask.shape[0] == module.bias.shape[0]:
+                    # 检查是否是结构化pruning（整行被 mask）
+                    is_structured = (mask.view(mask.size(0), -1).all(dim=1) == 0).any()
+                    if is_structured:
+                        # 计算通道 mask
+                        channel_mask = mask.view(mask.size(0), -1).any(dim=1).float()
+                        # 使用 custom_from_mask 对 bias 也应用 mask
+                        bias_mask = channel_mask.to(module.bias.device)
+                        prune.custom_from_mask(module, name='bias', mask=bias_mask)
+
+                # 记录pruning后的layer
+                self.pruned_layers.append((name, module))
+                applied_count += 1
+                print(f"   - 应用pruning到layer: {name}, 比例: {info['pruning_ratio']:.2%}")
+
+            except Exception as e:
+                print(f"[WARN]  应用pruningfailed {name}: {e}")
+                failed_count += 1
+                continue
+
+        self.pruning_applied = applied_count > 0
+        print(f"✅ pruning应用done (success {applied_count}/{len(self.pruning_candidates)} layer, failed {failed_count} layer)")
+
+        if applied_count == 0:
+            print("[WARN]  没有success应用任何pruning，恢复原始模型")
+            if self.original_model is not None:
+                self.model.load_state_dict(self.original_model)
+            return False
+
         return True
 
     def _get_module_by_name(self, name: str):
@@ -311,15 +556,280 @@ class PruningManager:
                 return None
         return module
 
-    def remove_pruning(self):
-        """移除剪枝包装，使剪枝永久化"""
-        if not self.pruning_applied:
+    def analyze_layer_sensitivity(self, dataloader, num_batches: int = 50) -> Dict[str, Dict[str, float]]:
+        """分析各层对剪枝的敏感性，用于指导剪枝比例分配
+
+        方法：临时剪枝每一层50%的参数，测量精度下降，下降越多越敏感
+
+        Args:
+            dataloader: 数据加载器
+            num_batches: 用于评估的批次数
+
+        Returns:
+            各层的敏感度信息字典
+        """
+        print(f"🔍 分析层敏感性 (使用 {num_batches} 批次)...")
+
+        self.model.eval()
+        device = next(self.model.parameters()).device
+
+        # 保存原始状态
+        original_state = copy.deepcopy(self.model.state_dict())
+
+        # 获取基线精度
+        baseline_acc = self._quick_evaluate(dataloader, num_batches, device)
+        print(f"   基线精度: {baseline_acc:.4f}")
+
+        sensitivities = {}
+
+        with torch.no_grad():
+            for name, module in list(self.model.named_modules()):
+                if not isinstance(module, (nn.Conv2d, nn.Linear)):
+                    continue
+
+                if not any(layer_type in name for layer_type in self.config.pruning_layers):
+                    continue
+
+                # 恢复原始状态
+                self.model.load_state_dict(original_state)
+
+                # 计算该层的重要性分数
+                weight = module.weight.data
+                if isinstance(module, nn.Conv2d):
+                    # 卷积层: 按输出通道计算L2范数
+                    importance = weight.view(weight.size(0), -1).norm(p=2, dim=1)
+                else:
+                    # 全连接层: 按输出神经元计算L2范数
+                    importance = weight.norm(p=2, dim=1)
+
+                # 临时剪枝50%的通道/神经元
+                num_total = len(importance)
+                num_prune = int(num_total * 0.5)
+
+                if num_prune == 0 or num_prune >= num_total:
+                    continue
+
+                sorted_indices = torch.argsort(importance)
+                prune_indices = sorted_indices[:num_prune]
+
+                # 创建并应用mask
+                mask = torch.ones_like(weight)
+                if isinstance(module, nn.Conv2d):
+                    mask[prune_indices] = 0
+                else:
+                    mask[prune_indices, :] = 0
+
+                # 临时应用剪枝
+                original_weight = weight.clone()
+                weight.mul_(mask)
+
+                # 评估精度
+                pruned_acc = self._quick_evaluate(dataloader, num_batches, device)
+                sensitivity = baseline_acc - pruned_acc
+
+                # 根据敏感度计算推荐剪枝比例
+                # 敏感度越高，推荐比例越低
+                if sensitivity < 0.01:  # 几乎无影响
+                    recommended_ratio = self.config.pruning_ratio
+                elif sensitivity < 0.03:  # 轻微影响
+                    recommended_ratio = self.config.pruning_ratio * 0.8
+                elif sensitivity < 0.05:  # 中等影响
+                    recommended_ratio = self.config.pruning_ratio * 0.6
+                else:  # 严重影响
+                    recommended_ratio = max(0.1, self.config.pruning_ratio * 0.3)
+
+                sensitivities[name] = {
+                    'sensitivity': float(sensitivity),
+                    'baseline_acc': float(baseline_acc),
+                    'pruned_acc': float(pruned_acc),
+                    'recommended_ratio': float(recommended_ratio),
+                    'num_channels': num_total,
+                    'num_pruned': num_prune
+                }
+
+                print(f"   {name}: 敏感度={sensitivity:.4f}, 推荐比例={recommended_ratio:.2f}")
+
+        # 恢复原始状态
+        self.model.load_state_dict(original_state)
+
+        # 保存敏感性分析结果供后续使用
+        self._sensitivity_analysis = sensitivities
+
+        print(f"✅ 敏感性分析完成 (分析了 {len(sensitivities)} 层)")
+        return sensitivities
+
+    def _quick_evaluate(self, dataloader, num_batches: int, device: str) -> float:
+        """快速评估模型精度 - 用于敏感性分析
+
+        使用CER作为评估指标（适合OCR任务）
+        """
+        self.model.eval()
+        total_cer = 0.0
+        num_samples = 0
+
+        with torch.no_grad():
+            for i, batch in enumerate(dataloader):
+                if i >= num_batches:
+                    break
+
+                images = batch['images'].to(device)
+                labels = batch['labels'].to(device)
+                label_lengths = batch.get('label_lengths')
+
+                outputs = self.model(images)
+
+                # 简化的CER计算
+                if 'ctc_logits' in outputs:
+                    logits = outputs['ctc_logits']
+                    predictions = logits.argmax(dim=-1)
+
+                    # 简单的CTC解码和CER计算
+                    for pred, label, label_len in zip(predictions, labels, label_lengths):
+                        pred_text = self._simple_ctc_decode(pred.cpu().numpy())
+                        label_text = self._simple_ctc_decode(label[:label_len].cpu().numpy())
+
+                        # 计算CER
+                        if len(label_text) > 0:
+                            cer = self._levenshtein_distance(pred_text, label_text) / len(label_text)
+                            total_cer += min(cer, 1.0)
+                            num_samples += 1
+
+        # 返回准确率 (1 - CER)
+        avg_cer = total_cer / num_samples if num_samples > 0 else 1.0
+        return max(0.0, 1.0 - avg_cer)
+
+    def _simple_ctc_decode(self, sequence: np.ndarray) -> str:
+        """简化的CTC解码 - 去除重复和空白"""
+        decoded = []
+        prev = -1
+        for token in sequence:
+            if token != prev and token != 0:  # 0假设为blank
+                decoded.append(str(token))
+            prev = token
+        return ''.join(decoded)
+
+    def _levenshtein_distance(self, s1: str, s2: str) -> int:
+        """计算编辑距离"""
+        if len(s1) < len(s2):
+            return self._levenshtein_distance(s2, s1)
+
+        if len(s2) == 0:
+            return len(s1)
+
+        previous_row = range(len(s2) + 1)
+        for i, c1 in enumerate(s1):
+            current_row = [i + 1]
+            for j, c2 in enumerate(s2):
+                # 计算插入、删除、替换的代价
+                insertions = previous_row[j + 1] + 1
+                deletions = current_row[j] + 1
+                substitutions = previous_row[j] + (c1 != c2)
+                current_row.append(min(insertions, deletions, substitutions))
+            previous_row = current_row
+
+        return previous_row[-1]
+
+    def _select_pruning_dim(self, module: nn.Module, layer_name: str) -> int:
+        """智能选择结构化剪枝的最佳维度
+
+        Args:
+            module: 要剪枝的模块
+            layer_name: 层的名称
+
+        Returns:
+            剪枝维度 (0=输出通道/神经元, 1=输入通道)
+        """
+        if isinstance(module, nn.Conv2d):
+            # 卷积层: weight shape = [out_channels, in_channels, kH, kW]
+            out_ch = module.out_channels
+            in_ch = module.in_channels
+
+            # 第一层卷积不要剪枝输入通道
+            if self._is_first_layer(module, layer_name):
+                return 0  # 只剪枝输出通道
+
+            # 分组卷积特殊处理
+            if module.groups > 1:
+                # 分组卷积通常剪枝输出通道更安全
+                return 0
+
+            # 对于标准卷积，优先剪枝输出通道
+            # 但如果输出通道远少于输入通道，考虑剪枝输入
+            if out_ch < in_ch * 0.3 and in_ch > 64:
+                return 1  # 输入通道远多于输出通道时剪枝输入
+            return 0  # 默认剪枝输出通道
+
+        elif isinstance(module, nn.Linear):
+            # 全连接层: weight shape = [out_features, in_features]
+            out_feat = module.out_features
+            in_feat = module.in_features
+
+            # 输出层保护（类别数较少时）
+            if out_feat < 100 and ('classifier' in layer_name or 'head' in layer_name):
+                return 1  # 剪枝输入特征，保护输出
+
+            # 默认剪枝输出神经元（更容易实现压缩）
+            return 0
+
+        return 0  # 默认维度
+
+    def make_pruning_permanent(self):
+        """使剪枝永久化
+
+        改进:
+        - 处理所有可能被剪枝的参数 (weight和bias)
+        - 在移除mask之前确保0值被正确保留
+        - 清理所有相关的剪枝状态
+        - 添加异常处理避免部分失败影响整体
+        """
+        if not self.pruning_applied and not self.pruned_layers:
             return
 
         print(f"🔧 永久化剪枝...")
+        permanent_count = 0
+        failed_layers = []
+
         for name, module in self.pruned_layers:
-            prune.remove(module, 'weight')
-        print(f"✅ 剪枝永久化完成")
+            # 处理所有可能被剪枝的参数
+            for param_name in ['weight', 'bias']:
+                mask_attr = f'{param_name}_mask'
+                orig_attr = f'{param_name}_orig'
+
+                if not hasattr(module, mask_attr):
+                    continue
+
+                try:
+                    # 获取mask并应用永久剪枝（确保0值被保留）
+                    mask = getattr(module, mask_attr)
+                    if hasattr(module, param_name):
+                        param = getattr(module, param_name)
+                        # 在remove之前确保参数值为mask后的值
+                        with torch.no_grad():
+                            param.data *= mask
+
+                    # 移除PyTorch剪枝的mask
+                    prune.remove(module, param_name)
+                    permanent_count += 1
+                    print(f"   - 永久化 {name}.{param_name}")
+
+                except Exception as e:
+                    failed_layers.append(f"{name}.{param_name}")
+                    print(f"   ⚠️ 永久化失败 {name}.{param_name}: {e}")
+                    continue
+
+                # 清理可能残留的属性
+                try:
+                    if hasattr(module, orig_attr):
+                        delattr(module, orig_attr)
+                except Exception:
+                    pass
+
+        self.pruning_applied = False
+        self.pruned_layers = []
+
+        if failed_layers:
+            print(f"⚠️ 部分层永久化失败: {failed_layers}")
+        print(f"✅ 剪枝永久化完成 (共 {permanent_count} 个参数)")
 
     def restore_original_model(self):
         """恢复原始模型"""
@@ -329,30 +839,253 @@ class PruningManager:
             self.pruned_layers = []
             print(f"🔄 恢复原始模型完成")
 
-    def calculate_pruning_ratio(self) -> float:
-        """计算实际剪枝比例"""
-        if not self.pruning_applied:
-            return 0.0
+    def _is_weight_pruned(self, weight: torch.Tensor) -> torch.Tensor:
+        """更鲁棒的剪枝检测 - 基于权重分布而非固定阈值
 
+        Args:
+            weight: 权重张量
+
+        Returns:
+            布尔张量，表示哪些元素被剪枝
+        """
+        # 方法1: 检查是否为精确的0（PyTorch prune设置的就是精确的0）
+        exact_zero = (weight == 0)
+
+        # 方法2: 对于浮点误差，使用相对阈值
+        # 如果权重的绝对值小于权重标准差的1e-6倍，认为是被剪枝的
+        weight_std = weight.std()
+        if weight_std > 0:
+            relative_threshold = weight_std * 1e-6
+            near_zero = torch.abs(weight) < relative_threshold
+        else:
+            near_zero = torch.zeros_like(weight, dtype=torch.bool)
+
+        return exact_zero | near_zero
+
+    def calculate_pruning_ratio(self, include_bias: bool = False) -> float:
+        """计算实际剪枝比例
+
+        改进:
+        - 使用 _is_weight_pruned() 进行更准确的检测
+        - 区分非结构化剪枝(0值)和结构化剪枝(维度减少)
+        - 支持检测PyTorch prune模块创建的weight_mask
+
+        Args:
+            include_bias: 是否包含偏置参数（默认False，因为通常只剪枝权重）
+
+        Returns:
+            全局剪枝比例(0-1)
+        """
         total_params = 0
         pruned_params = 0
 
         for name, module in self.model.named_modules():
-            if isinstance(module, (nn.Conv2d, nn.Linear)):
-                # 检查是否有weight_mask属性（剪枝后的标志）
+            if not isinstance(module, (nn.Conv2d, nn.Linear)):
+                continue
+
+            # 计算权重参数
+            weight = module.weight
+            total_params += weight.numel()
+
+            # 方法1: 使用标准API检查PyTorch prune模块创建的mask（最准确）
+            if prune.is_pruned(module):
+                # 使用weight_mask进行精确计算
                 if hasattr(module, 'weight_mask'):
-                    weight = module.weight
                     mask = module.weight_mask
-                    total_params += weight.numel()
                     pruned_params += (mask == 0).sum().item()
                 else:
-                    weight = module.weight
-                    total_params += weight.numel()
+                    pruned_params += self._is_weight_pruned(weight).sum().item()
+            # 方法2: 使用改进的检测方法（永久化剪枝后）
+            else:
+                pruned_params += self._is_weight_pruned(weight).sum().item()
 
-        if total_params == 0:
-            return 0.0
+            # 可选：检查bias
+            if include_bias and module.bias is not None:
+                total_params += module.bias.numel()
+                if prune.is_pruned(module) and hasattr(module, 'bias_mask'):
+                    pruned_params += (module.bias_mask == 0).sum().item()
+                else:
+                    pruned_params += self._is_weight_pruned(module.bias).sum().item()
 
-        return pruned_params / total_params
+        return pruned_params / total_params if total_params > 0 else 0.0
+
+    def calculate_structured_pruning_ratio(self) -> Tuple[float, int, int]:
+        """计算结构化剪枝比例（通道/神经元级别）
+
+        Returns:
+            (结构化剪枝比例, 被剪枝通道数, 总通道数)
+        """
+        total_channels = 0
+        pruned_channels = 0
+
+        for name, module in self.model.named_modules():
+            if not isinstance(module, (nn.Conv2d, nn.Linear)):
+                continue
+
+            if isinstance(module, nn.Conv2d):
+                total_ch = module.out_channels
+            else:
+                total_ch = module.out_features
+
+            total_channels += total_ch
+
+            # 检查每个输出通道是否全部被剪枝
+            weight = module.weight
+            if prune.is_pruned(module) and hasattr(module, 'weight_mask'):
+                mask = module.weight_mask
+                channel_active = mask.view(mask.size(0), -1).any(dim=1)
+            else:
+                channel_active = ~self._is_weight_pruned(weight).view(weight.size(0), -1).all(dim=1)
+
+            pruned_channels += (~channel_active).sum().item()
+
+        ratio = pruned_channels / total_channels if total_channels > 0 else 0.0
+        return ratio, pruned_channels, total_channels
+
+    def get_structured_pruning_stats(self) -> Dict[str, Any]:
+        """获取结构化剪枝的统计信息（输出通道/神经元级别）
+
+        使用 _is_weight_pruned() 进行更准确的检测
+
+        Returns:
+            结构化剪枝统计信息
+        """
+        stats = {
+            'total_layers': 0,
+            'pruned_channels': 0,
+            'total_channels': 0,
+            'layer_details': []
+        }
+
+        for name, module in self.model.named_modules():
+            if not isinstance(module, (nn.Conv2d, nn.Linear)):
+                continue
+
+            if isinstance(module, nn.Conv2d):
+                total_ch = module.out_channels
+            else:
+                total_ch = module.out_features
+
+            # 检查该层是否有剪枝 - 使用改进的检测方法
+            pruned_ch = 0
+            weight = module.weight
+            if weight.dim() >= 2:
+                # 检查每个输出通道是否全部被剪枝
+                if prune.is_pruned(module) and hasattr(module, 'weight_mask'):
+                    mask = module.weight_mask
+                    channel_active = mask.view(mask.size(0), -1).any(dim=1)
+                else:
+                    # 使用 _is_weight_pruned 进行更准确检测
+                    pruned_mask = self._is_weight_pruned(weight)
+                    channel_active = ~pruned_mask.view(weight.size(0), -1).all(dim=1)
+
+                pruned_ch = (~channel_active).sum().item()
+
+            if pruned_ch > 0 or total_ch > 0:
+                stats['total_layers'] += 1
+                stats['pruned_channels'] += pruned_ch
+                stats['total_channels'] += total_ch
+
+                stats['layer_details'].append({
+                    'name': name,
+                    'type': module.__class__.__name__,
+                    'total_channels': total_ch,
+                    'pruned_channels': pruned_ch,
+                    'ratio': pruned_ch / total_ch if total_ch > 0 else 0
+                })
+
+        return stats
+
+    def get_detailed_pruning_stats(self) -> Dict[str, Any]:
+        """获取详细的剪枝统计信息
+
+        使用 _is_weight_pruned() 进行更准确的检测
+
+        Returns:
+            包含全局和各层详细统计的字典
+        """
+        stats = {
+            'total_params': 0,
+            'pruned_params': 0,
+            'global_ratio': 0.0,
+            'pruned_layers_count': len(self.pruned_layers),
+            'layer_stats': []
+        }
+
+        for name, module in self.model.named_modules():
+            if not isinstance(module, (nn.Conv2d, nn.Linear)):
+                continue
+
+            weight = module.weight
+            layer_total = weight.numel()
+
+            # 检测剪枝数量 - 使用改进的方法
+            if prune.is_pruned(module) and hasattr(module, 'weight_mask'):
+                layer_pruned = (module.weight_mask == 0).sum().item()
+                pruning_method = 'mask'
+            else:
+                # 使用 _is_weight_pruned 进行更准确检测
+                layer_pruned = self._is_weight_pruned(weight).sum().item()
+                pruning_method = 'permanent' if layer_pruned > 0 else 'none'
+
+            layer_ratio = layer_pruned / layer_total if layer_total > 0 else 0.0
+
+            # 计算层信息
+            layer_info = {
+                'name': name,
+                'type': module.__class__.__name__,
+                'total_params': int(layer_total),
+                'pruned_params': int(layer_pruned),
+                'pruning_ratio': float(layer_ratio),
+                'pruning_method': pruning_method,
+                'shape': list(weight.shape)
+            }
+
+            # 添加额外信息
+            if isinstance(module, nn.Conv2d):
+                layer_info['in_channels'] = module.in_channels
+                layer_info['out_channels'] = module.out_channels
+                layer_info['kernel_size'] = module.kernel_size
+            elif isinstance(module, nn.Linear):
+                layer_info['in_features'] = module.in_features
+                layer_info['out_features'] = module.out_features
+
+            stats['layer_stats'].append(layer_info)
+            stats['total_params'] += layer_total
+            stats['pruned_params'] += layer_pruned
+
+        # 计算全局比例
+        if stats['total_params'] > 0:
+            stats['global_ratio'] = stats['pruned_params'] / stats['total_params']
+
+        # 排序：按剪枝比例降序
+        stats['layer_stats'].sort(key=lambda x: x['pruning_ratio'], reverse=True)
+
+        return stats
+
+    def print_pruning_stats(self):
+        """打印剪枝统计信息（便于调试）"""
+        stats = self.get_detailed_pruning_stats()
+
+        print("\n📊 剪枝统计信息:")
+        print("=" * 80)
+        print(f"总参数量: {stats['total_params']:,}")
+        print(f"剪枝参数量: {stats['pruned_params']:,}")
+        print(f"全局剪枝比例: {stats['global_ratio']:.2%}")
+        print(f"剪枝层数: {stats['pruned_layers_count']}")
+        print("\n各层详情 (前10):")
+        print("-" * 80)
+        print(f"{'层名':<40} {'类型':<12} {'总参数':>12} {'剪枝比例':>10}")
+        print("-" * 80)
+
+        for layer_info in stats['layer_stats'][:10]:
+            name = layer_info['name'][:38]
+            layer_type = layer_info['type'][:10]
+            total = layer_info['total_params']
+            ratio = layer_info['pruning_ratio']
+            print(f"{name:<40} {layer_type:<12} {total:>12,} {ratio:>9.1%}")
+
+        print("=" * 80)
 
     def get_pruned_model_info(self) -> Dict:
         """获取剪枝后的模型信息"""
@@ -436,6 +1169,171 @@ class PruningManager:
 
         return start_finetune_epoch <= epoch < end_finetune_epoch
 
+    def visualize_pruning(self, save_path: str = 'pruning_visualization.png'):
+        """可视化剪枝效果
+
+        生成包含以下内容的可视化图表:
+        - 各层剪枝比例条形图
+        - 权重稀疏性热力图
+        - 结构化剪枝通道分布
+        - 剪枝前后参数量对比
+
+        Args:
+            save_path: 保存路径
+        """
+        import matplotlib.pyplot as plt
+
+        stats = self.get_detailed_pruning_stats()
+
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        fig.suptitle('Pruning Visualization', fontsize=16, fontweight='bold')
+
+        # 1. 各层剪枝比例
+        ax = axes[0, 0]
+        layer_names = [s['name'].split('.')[-1][:15] for s in stats['layer_stats'][:15]]
+        ratios = [s['pruning_ratio'] for s in stats['layer_stats'][:15]]
+        colors = ['green' if r < 0.2 else 'orange' if r < 0.5 else 'red' for r in ratios]
+        bars = ax.barh(layer_names, ratios, color=colors, alpha=0.7)
+        ax.set_xlabel('Pruning Ratio')
+        ax.set_title('Layer-wise Pruning Ratio')
+        ax.set_xlim(0, 1)
+        ax.axvline(x=self.config.pruning_ratio, color='blue', linestyle='--',
+                  label=f'Target ({self.config.pruning_ratio:.0%})')
+        ax.legend()
+
+        # 2. 权重分布对比
+        ax = axes[0, 1]
+        all_weights = []
+        for name, module in self.model.named_modules():
+            if isinstance(module, (nn.Conv2d, nn.Linear)):
+                weights = module.weight.data.flatten().cpu().numpy()
+                all_weights.extend(weights)
+
+        if len(all_weights) > 0:
+            ax.hist(all_weights, bins=100, alpha=0.7, color='blue', edgecolor='black')
+            ax.set_xlabel('Weight Value')
+            ax.set_ylabel('Count')
+            ax.set_title('Weight Distribution (Log Scale)')
+            ax.set_yscale('log')
+            ax.axvline(x=0, color='red', linestyle='--', label='Zero')
+            ax.legend()
+
+        # 3. 结构化剪枝统计
+        ax = axes[1, 0]
+        struct_stats = self.get_structured_pruning_stats()
+        layer_names_struct = [d['name'].split('.')[-1][:10] for d in struct_stats['layer_details'][:10]]
+        total_ch = [d['total_channels'] for d in struct_stats['layer_details'][:10]]
+        pruned_ch = [d['pruned_channels'] for d in struct_stats['layer_details'][:10]]
+
+        x = range(len(layer_names_struct))
+        ax.bar(x, total_ch, label='Total Channels', alpha=0.7)
+        ax.bar(x, pruned_ch, label='Pruned Channels', alpha=0.7)
+        ax.set_xticks(x)
+        ax.set_xticklabels(layer_names_struct, rotation=45, ha='right')
+        ax.set_ylabel('Channel Count')
+        ax.set_title('Structured Pruning Stats')
+        ax.legend()
+
+        # 4. 参数统计
+        ax = axes[1, 1]
+        categories = ['Original', 'After Pruning', 'Removed']
+        original = stats['total_params']
+        removed = stats['pruned_params']
+        remaining = original - removed
+        values = [original, remaining, removed]
+        colors = ['blue', 'green', 'red']
+
+        bars = ax.bar(categories, values, color=colors, alpha=0.7)
+        ax.set_ylabel('Parameter Count')
+        ax.set_title(f'Parameter Statistics\n(Global Ratio: {stats["global_ratio"]:.2%})')
+
+        # 添加数值标签
+        for bar, val in zip(bars, values):
+            height = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width()/2., height,
+                   f'{val/1e6:.2f}M', ha='center', va='bottom')
+
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close()
+
+        print(f"📊 剪枝可视化已保存: {save_path}")
+
+    def apply_iterative_pruning(self, epoch: int, start_epoch: int, end_epoch: int,
+                                target_ratio: float, dataloader=None) -> bool:
+        """渐进式剪枝
+
+        避免一次性剪枝导致精度损失过大，通过渐进方式让模型逐步适应。
+
+        Args:
+            epoch: 当前epoch
+            start_epoch: 渐进剪枝开始epoch
+            end_epoch: 渐进剪枝结束epoch
+            target_ratio: 最终目标剪枝比例
+            dataloader: 用于敏感性分析的数据加载器（可选）
+
+        Returns:
+            是否应用了剪枝
+        """
+        if not self.config.enabled:
+            return False
+
+        if epoch < start_epoch or epoch > end_epoch:
+            return False
+
+        # 第一次进入渐进剪枝时，保存原始模型
+        if epoch == start_epoch:
+            self.original_model = copy.deepcopy(self.model.state_dict())
+            self._clear_all_pruning_masks()
+
+        # 计算当前进度
+        total_epochs = end_epoch - start_epoch + 1
+        current_progress = (epoch - start_epoch + 1) / total_epochs
+
+        # 平滑渐进：使用平方根函数
+        progress = np.sqrt(current_progress)
+        current_target_ratio = target_ratio * progress
+
+        print(f"🎯 渐进式剪枝 - Epoch {epoch}/{end_epoch}")
+        print(f"   进度: {current_progress:.1%}, 当前目标比例: {current_target_ratio:.2%}")
+
+        # 恢复原始模型并清理状态（每次从原始状态开始）
+        if self.original_model is not None:
+            self.model.load_state_dict(self.original_model)
+            self._clear_all_pruning_masks()
+
+        # 可选：使用敏感性分析调整各层比例
+        sensitivities = getattr(self, '_sensitivity_analysis', None)
+
+        # 应用渐进剪枝
+        for name, module in self.model.named_modules():
+            if not self._is_prunable_module(module, name):
+                continue
+
+            # 基础比例
+            layer_ratio = self.get_pruning_ratio(name) * progress
+
+            # 根据敏感性调整（如果有分析结果）
+            if sensitivities and name in sensitivities:
+                sens = sensitivities[name]['sensitivity']
+                # 敏感度高的层减少剪枝比例
+                if sens > 0.05:
+                    layer_ratio *= 0.5
+                elif sens > 0.03:
+                    layer_ratio *= 0.7
+
+            # 确保比例不超过当前目标
+            layer_ratio = min(layer_ratio, current_target_ratio)
+
+            if layer_ratio > 0.01:  # 至少1%才剪枝
+                self._apply_pruning_to_module(module, name, layer_ratio)
+
+        self.pruning_applied = True
+        actual_ratio = self.calculate_pruning_ratio()
+        print(f"✅ 渐进剪枝完成，实际比例: {actual_ratio:.2%}")
+
+        return True
+
     def get_finetune_lr_multiplier(self, epoch: int) -> float:
         """获取微调阶段的学习率乘数"""
         if not self.is_finetuning_time(epoch):
@@ -443,6 +1341,687 @@ class PruningManager:
 
         # 微调阶段使用较低的学习率
         return 0.1
+
+    def apply_pruning_with_validation(self, epoch: int, current_acc: float, best_acc: float,
+                                      val_dataloader=None, max_acc_drop: float = None) -> bool:
+        """带验证的剪枝应用 - 如果精度下降过大则回滚
+
+        Args:
+            epoch: 当前epoch
+            current_acc: 当前精度
+            best_acc: 最佳精度
+            val_dataloader: 验证数据加载器（可选，用于快速验证）
+            max_acc_drop: 允许的最大精度下降（默认使用 config.min_acc_drop）
+
+        Returns:
+            是否成功应用剪枝
+        """
+        if max_acc_drop is None:
+            max_acc_drop = self.config.min_acc_drop
+
+        # 先进行标准剪枝检查
+        if not self._should_prune(epoch, current_acc, best_acc):
+            return False
+
+        # 保存剪枝前的状态
+        state_before = copy.deepcopy(self.model.state_dict())
+
+        # 应用剪枝
+        if not self.apply_pruning(epoch, current_acc, best_acc):
+            return False
+
+        # 如果有验证数据，进行快速验证
+        if val_dataloader is not None:
+            print(f"🔍 验证剪枝效果...")
+            val_acc = self._quick_evaluate(val_dataloader, 20,
+                                           next(self.model.parameters()).device)
+            actual_drop = best_acc - val_acc
+
+            if actual_drop > max_acc_drop:
+                print(f"⚠️ 精度下降过大 (下降 {actual_drop:.4f} > 阈值 {max_acc_drop:.4f})，回滚剪枝")
+                self.model.load_state_dict(state_before)
+                self._clear_all_pruning_masks()
+                self.original_model = None
+                self.pruning_applied = False
+                return False
+
+            print(f"✅ 剪枝验证通过，精度下降: {actual_drop:.4f}")
+
+        return True
+
+    def _find_associated_bn(self, module: nn.Module, module_name: str) -> Optional[Tuple[str, nn.BatchNorm2d]]:
+        """找到与卷积层关联的BatchNorm层
+
+        Args:
+            module: 卷积层模块
+            module_name: 卷积层名称
+
+        Returns:
+            (bn_name, bn_module) 或 None
+        """
+        # 策略1: 同级的BatchNorm（如 conv -> bn）
+        parent_name = '.'.join(module_name.split('.')[:-1])
+        module_base_name = module_name.split('.')[-1]
+
+        for name, m in self.model.named_modules():
+            # 检查是否为BatchNorm
+            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                # 检查是否可能是关联的BN
+                bn_name = name.split('.')[-1]
+                # 常见命名模式: conv->bn, conv1->bn1, etc.
+                if (parent_name in name or name.startswith(parent_name)):
+                    # 检查通道数是否匹配
+                    if hasattr(m, 'num_features'):
+                        if isinstance(module, nn.Conv2d) and m.num_features == module.out_channels:
+                            return name, m
+        return None
+
+    def _adjust_bn_after_structured_pruning(self, module: nn.Module, module_name: str,
+                                            pruned_indices: torch.Tensor):
+        """结构化剪枝后调整 BatchNorm 层 - 完整实现
+
+        Args:
+            module: 被剪枝的模块
+            module_name: 模块名称
+            pruned_indices: 被剪枝的输出通道索引
+        """
+        if len(pruned_indices) == 0:
+            return
+
+        # 找到关联的BN层
+        bn_result = self._find_associated_bn(module, module_name)
+        if bn_result is None:
+            return
+
+        bn_name, bn_module = bn_result
+
+        try:
+            # 创建掩码，标记保留的通道
+            num_features = bn_module.num_features
+            keep_mask = torch.ones(num_features, dtype=torch.bool, device=bn_module.weight.device)
+            keep_mask[pruned_indices] = False
+            new_num_features = keep_mask.sum().item()
+
+            if new_num_features == 0:
+                print(f"   warning: BNlayer {bn_name} 所有通道将被pruning，跳过调整")
+                return
+
+            # 调整BN参数 - 创建新的 Parameter 而不是修改 data
+            with torch.no_grad():
+                # 调整权重和偏置
+                if bn_module.weight is not None:
+                    new_weight = nn.Parameter(bn_module.weight.data[keep_mask])
+                    bn_module.weight = new_weight
+                if bn_module.bias is not None:
+                    new_bias = nn.Parameter(bn_module.bias.data[keep_mask])
+                    bn_module.bias = new_bias
+
+                # 调整running statistics - 直接修改data，避免重新注册buffer
+                # 重新register_buffer会导致状态丢失和训练中断，直接修改data更安全
+                if hasattr(bn_module, 'running_mean'):
+                    with torch.no_grad():
+                        new_running_mean = bn_module.running_mean[keep_mask].clone()
+                        bn_module.running_mean.data = new_running_mean
+                if hasattr(bn_module, 'running_var'):
+                    with torch.no_grad():
+                        new_running_var = bn_module.running_var[keep_mask].clone()
+                        # 确保方差不为零
+                        new_running_var = torch.clamp(new_running_var, min=1e-5)
+                        bn_module.running_var.data = new_running_var
+
+                # 调整 num_batches_tracked (如果存在)
+                if hasattr(bn_module, 'num_batches_tracked'):
+                    # 保持原值，不需要调整
+                    pass
+
+            # 注意: PyTorch 的 num_features 是只读属性，不能直接修改
+            # 但在实际运行中，上面调整的 weight/bias/running_mean/running_var 的
+            # 形状会自动反映到 num_features
+            actual_num_features = bn_module.weight.shape[0] if bn_module.weight is not None else \
+                                 (bn_module.running_mean.shape[0] if hasattr(bn_module, 'running_mean') else new_num_features)
+
+            print(f"   调整BNlayer: {bn_name}, 通道: {num_features} -> {actual_num_features}")
+
+        except Exception as e:
+            print(f"   调整BN层失败 {bn_name}: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def get_layer_connectivity(self) -> Dict[str, List[str]]:
+        """分析模型层之间的连接关系 - 用于结构化剪枝后的维度调整
+
+        改进内容:
+        1. 使用更智能的方法分析 Sequential 和 ModuleList 中的连接关系
+        2. 返回前序layer到后继layer的映射
+
+        Returns:
+            层名到其后继层列表的映射
+        """
+        connectivity = {}
+
+        # 收集所有可pruninglayer
+        prunable_layers = []
+        for name, module in self.model.named_modules():
+            if isinstance(module, (nn.Conv2d, nn.Linear)):
+                prunable_layers.append((name, module))
+
+        # 分析连接关系
+        for i, (name, module) in enumerate(prunable_layers):
+            # 默认认为同一父模块中的相邻layer有连接关系
+            for j in range(i + 1, len(prunable_layers)):
+                next_name, next_module = prunable_layers[j]
+
+                # 检查命名layer级关系
+                name_parts = name.split('.')
+                next_parts = next_name.split('.')
+
+                # 如果在同一父模块中，认为有连接
+                if len(name_parts) == len(next_parts):
+                    same_parent = all(name_parts[k] == next_parts[k] for k in range(len(name_parts) - 1))
+                    if same_parent:
+                        connectivity.setdefault(name, []).append(next_name)
+                        break  # 只找直接后继
+
+        return connectivity
+
+    def validate_pruning_with_rollback(self, val_dataloader,
+                                       max_acc_drop: float = None) -> bool:
+        """验证剪枝效果，如不满足条件则自动回滚
+
+        这是一个增强的验证方法，可以在剪枝后立即验证效果，
+        如果精度下降过大则自动回滚。
+
+        Args:
+            val_dataloader: 验证数据加载器
+            max_acc_drop: 允许的最大精度下降（默认使用config.min_acc_drop）
+
+        Returns:
+            是否接受当前剪枝（True=接受，False=已回滚）
+        """
+        if max_acc_drop is None:
+            max_acc_drop = self.config.min_acc_drop
+
+        if not self.pruning_applied:
+            print("⚠️ 没有应用剪枝，无需验证")
+            return True
+
+        print(f"🔍 验证剪枝效果...")
+
+        # 保存当前状态（用于回滚）
+        state_before = copy.deepcopy(self.model.state_dict())
+
+        # 永久化剪枝以进行准确评估
+        self.make_pruning_permanent()
+
+        try:
+            # 快速评估
+            current_acc = self._quick_evaluate(
+                val_dataloader,
+                num_batches=20,
+                device=next(self.model.parameters()).device
+            )
+
+            # 计算相对于原始精度的下降（使用保存的原始模型）
+            if self.original_model is not None:
+                # 临时加载原始模型进行评估
+                current_state = copy.deepcopy(self.model.state_dict())
+                self.model.load_state_dict(self.original_model)
+                original_acc = self._quick_evaluate(
+                    val_dataloader,
+                    num_batches=20,
+                    device=next(self.model.parameters()).device
+                )
+                # 恢复当前状态
+                self.model.load_state_dict(current_state)
+
+                acc_drop = original_acc - current_acc
+                print(f"   原始精度: {original_acc:.4f}")
+                print(f"   剪枝后精度: {current_acc:.4f}")
+                print(f"   精度下降: {acc_drop:.4f}")
+
+                if acc_drop > max_acc_drop:
+                    print(f"⚠️ 精度下降过大 ({acc_drop:.4f} > {max_acc_drop:.4f})，执行回滚")
+                    self.model.load_state_dict(state_before)
+                    self.pruning_applied = False
+                    self.pruned_layers = []
+                    self._clear_all_pruning_masks()
+                    return False
+                else:
+                    print(f"✅ 剪枝验证通过")
+                    return True
+            else:
+                print("⚠️ 未保存原始模型状态，无法计算精度下降")
+                return True
+
+        except Exception as e:
+            print(f"❌ 验证过程出错: {e}，执行回滚")
+            self.model.load_state_dict(state_before)
+            return False
+
+    def compress_model_structurally(self, val_dataloader=None,
+                                    max_acc_drop: float = 0.02) -> nn.Module:
+        """真正的结构化压缩 - 删除被剪枝的通道/神经元并重建模型
+
+        这是一个高级功能，会：
+        1. 分析当前剪枝状态，识别被完全剪枝的通道
+        2. 创建新的压缩后的层
+        3. 复制保留的权重
+        4. 调整后续层的输入维度
+        5. 调整关联的BatchNorm层
+
+        Args:
+            val_dataloader: 验证数据加载器（用于验证压缩后效果）
+            max_acc_drop: 允许的最大精度下降
+
+        Returns:
+            压缩后的模型（原模型被修改）
+        """
+        if not self.pruning_applied:
+            print("⚠️ 没有应用剪枝，无法压缩")
+            return self.model
+
+        print(f"🔧 开始结构化压缩...")
+
+        # 先永久化当前的剪枝
+        self.make_pruning_permanent()
+
+        # 构建layer依赖图和顺序
+        layer_order = []
+        layer_outputs = {}  # 记录每layer输出维度变化
+        layer_inputs = {}   # 记录每layer输入维度变化
+
+        # 第一步：收集所有可pruninglayer的信息
+        for name, module in self.model.named_modules():
+            if not isinstance(module, (nn.Conv2d, nn.Linear)):
+                continue
+
+            weight = module.weight
+            if weight.dim() >= 2:
+                # 检查每个输出通道是否全部被pruning
+                channel_active = ~(self._is_weight_pruned(weight).view(weight.size(0), -1).all(dim=1))
+                if (~channel_active).any():
+                    keep_indices = torch.where(channel_active)[0]
+                    layer_order.append(name)
+                    layer_outputs[name] = {
+                        'module': module,
+                        'keep_indices': keep_indices,
+                        'original_out': weight.size(0),
+                        'new_out': len(keep_indices),
+                        'module_type': type(module).__name__
+                    }
+                    # 记录原始输入维度
+                    if isinstance(module, nn.Conv2d):
+                        layer_inputs[name] = module.in_channels
+                    else:
+                        layer_inputs[name] = module.in_features
+                    print(f"   计划压缩 {name}: {weight.size(0)} -> {len(keep_indices)} channels")
+
+        if len(layer_order) == 0:
+            print("ℹ️ 没有需要压缩的层")
+            return self.model
+
+        # 第二步：分析layer间连接关系，构建输入维度映射
+        # 对于每个layer，找出哪些layer的输出连接到它的输入
+        input_mapping = self._build_input_mapping(layer_order, layer_outputs)
+
+        # 第三步：按顺序应用压缩
+        compressed_count = 0
+        for name in layer_order:
+            info = layer_outputs[name]
+            try:
+                module = info['module']
+                keep_indices = info['keep_indices']
+
+                # 计算新的输入维度（可能被前面的layer修改过）
+                new_in_features = self._get_new_input_dim(name, layer_inputs, input_mapping, layer_outputs)
+
+                # 创建新layer
+                if isinstance(module, nn.Conv2d):
+                    new_module = self._create_compressed_conv2d(module, keep_indices, new_in_features)
+                elif isinstance(module, nn.Linear):
+                    new_module = self._create_compressed_linear(module, keep_indices, new_in_features)
+                else:
+                    continue
+
+                # 替换原模块
+                parent_name = '.'.join(name.split('.')[:-1])
+                module_base_name = name.split('.')[-1]
+
+                if parent_name:
+                    parent = self._get_module_by_name(parent_name)
+                    if parent is not None:
+                        setattr(parent, module_base_name, new_module)
+                else:
+                    setattr(self.model, module_base_name, new_module)
+
+                # 调整关联的BN层
+                pruned_indices = torch.tensor([i for i in range(info['original_out'])
+                                              if i not in keep_indices.tolist()])
+                self._adjust_bn_after_structured_pruning(new_module, name, pruned_indices)
+
+                # 更新输出信息，供后续layer使用
+                info['new_module'] = new_module
+                compressed_count += 1
+                print(f"   done压缩 {name}: 输入 {layer_inputs[name]}->{new_in_features}, "
+                      f"输出 {info['original_out']}->{info['new_out']}")
+
+            except Exception as e:
+                print(f"   压缩层 {name} 失败: {e}")
+                import traceback
+                traceback.print_exc()
+                continue
+
+        print(f"✅ 结构化压缩完成 (压缩了 {compressed_count} 层)")
+
+        # 验证压缩效果
+        if val_dataloader is not None:
+            print("⚠️ 验证压缩后的模型...")
+            try:
+                # 先测试一个前向传播看是否能正常运行
+                test_input = next(iter(val_dataloader))['images']
+                test_input = test_input.to(next(self.model.parameters()).device)
+                with torch.no_grad():
+                    _ = self.model(test_input[:1])
+                print("   模型前向传播测试通过")
+
+                is_valid = self.validate_pruning_with_rollback(val_dataloader, max_acc_drop)
+                if not is_valid:
+                    print("[WARN] 压缩后accuracy下降过大，已回滚")
+            except Exception as e:
+                print(f"   压缩后模型验证failed: {e}")
+                print("   执行回滚...")
+                if self.original_model is not None:
+                    self.model.load_state_dict(self.original_model)
+                    self._clear_all_pruning_masks()
+
+        return self.model
+
+    def _build_input_mapping(self, layer_order: List[str], layer_outputs: Dict) -> Dict[str, List[str]]:
+        """构建layer间输入映射关系
+
+        对于每个layer，找出哪些前序layer的输出连接到它的输入
+
+        Returns:
+            layer名 -> 前序layer名列表的映射
+        """
+        input_mapping = {}
+
+        # 按名称layer级排序，模拟拓扑顺序
+        sorted_layers = sorted(layer_order, key=lambda x: len(x.split('.')))
+
+        for i, name in enumerate(sorted_layers):
+            input_mapping[name] = []
+            current_module = layer_outputs[name]['module']
+
+            # 查找所有可能的前序layer
+            for prev_name in sorted_layers[:i]:
+                prev_module = layer_outputs[prev_name]['module']
+
+                # 检查命名关系（简单启发式）
+                # 如果当前layer名称以前序layer名称开头，可能有连接关系
+                if name.startswith(prev_name) or self._are_layers_connected(prev_module, current_module):
+                    input_mapping[name].append(prev_name)
+
+        return input_mapping
+
+    def _are_layers_connected(self, prev_module: nn.Module, current_module: nn.Module) -> bool:
+        """检查两个layer是否可能连接（简单启发式）"""
+        # 这里使用简单的启发式：Sequential 中的相邻layer
+        # 更复杂的模型结构可能需要更复杂的分析
+        return False  # 默认不假设连接，依赖名称layer级关系
+
+    def _get_new_input_dim(self, name: str, layer_inputs: Dict, input_mapping: Dict,
+                          layer_outputs: Dict) -> int:
+        """计算layer的新输入维度
+
+        根据前序layer的输出维度变化，计算当前layer应有的输入维度
+        """
+        original_in = layer_inputs[name]
+        predecessor_layers = input_mapping.get(name, [])
+
+        # 如果没有前序layer信息，返回原始输入维度
+        if not predecessor_layers:
+            return original_in
+
+        # 对于每个前序layer，检查其输出维度是否改变
+        # 对于 Conv2d->Conv2d 或 Linear->Linear 的直连关系
+        for pred_name in predecessor_layers:
+            if pred_name in layer_outputs:
+                pred_info = layer_outputs[pred_name]
+                if 'new_out' in pred_info and pred_info['new_out'] != pred_info['original_out']:
+                    # 前序layer输出被压缩，当前layer输入应相应调整
+                    return pred_info['new_out']
+
+        return original_in
+
+    def _create_compressed_conv2d(self, module: nn.Conv2d, keep_indices: torch.Tensor,
+                                  new_in_channels: int) -> nn.Conv2d:
+        """创建压缩后的 Conv2d layer"""
+        new_out_channels = len(keep_indices)
+
+        new_module = nn.Conv2d(
+            in_channels=new_in_channels,
+            out_channels=new_out_channels,
+            kernel_size=module.kernel_size,
+            stride=module.stride,
+            padding=module.padding,
+            dilation=module.dilation,
+            groups=module.groups if module.groups == 1 else min(module.groups, new_out_channels),
+            bias=module.bias is not None,
+            padding_mode=module.padding_mode
+        )
+
+        with torch.no_grad():
+            # 复制权重 - 需要考虑输入维度的变化
+            if new_in_channels == module.in_channels:
+                # 输入维度未变，只调整输出维度
+                new_module.weight.copy_(module.weight.data[keep_indices])
+            else:
+                # 输入维度也变了，需要同时调整
+                # 找出输入维度保留的索引
+                # 这里假设输入维度的压缩比例与输出相同（简化处理）
+                # 实际应用中可能需要更复杂的映射
+                in_ratio = new_in_channels / module.in_channels
+                in_keep_count = int(module.in_channels * in_ratio)
+                in_keep_indices = torch.linspace(0, module.in_channels - 1, in_keep_count).long()
+                new_module.weight.copy_(module.weight.data[keep_indices][:, in_keep_indices])
+
+            if module.bias is not None:
+                new_module.bias.copy_(module.bias.data[keep_indices])
+
+        return new_module
+
+    def _create_compressed_linear(self, module: nn.Linear, keep_indices: torch.Tensor,
+                                  new_in_features: int) -> nn.Linear:
+        """创建压缩后的 Linear layer"""
+        new_out_features = len(keep_indices)
+
+        new_module = nn.Linear(
+            in_features=new_in_features,
+            out_features=new_out_features,
+            bias=module.bias is not None
+        )
+
+        with torch.no_grad():
+            # 复制权重 - 需要考虑输入维度的变化
+            if new_in_features == module.in_features:
+                # 输入维度未变，只调整输出维度
+                new_module.weight.copy_(module.weight.data[keep_indices])
+            else:
+                # 输入维度也变了，需要同时调整
+                # 找出输入维度保留的索引
+                in_ratio = new_in_features / module.in_features
+                in_keep_count = int(module.in_features * in_ratio)
+                in_keep_indices = torch.linspace(0, module.in_features - 1, in_keep_count).long()
+                new_module.weight.copy_(module.weight.data[keep_indices][:, in_keep_indices])
+
+            if module.bias is not None:
+                new_module.bias.copy_(module.bias.data[keep_indices])
+
+        return new_module
+
+
+class PruningQuantizationScheduler:
+    """剪枝与量化的协同调度器 - 协调剪枝和QAT的训练流程
+
+    提供两种训练模式:
+    1. 先剪枝后量化: 训练 -> 剪枝 -> 微调 -> 插入QAT -> QAT训练
+    2. 交替进行: 训练 -> 部分剪枝 -> 部分QAT -> 重复
+
+    Attributes:
+        pruning_manager: 剪枝管理器
+        qat_scheduler: QAT训练调度器
+        current_stage: 当前训练阶段
+    """
+
+    STAGES = ['warmup', 'pre_pruning', 'pruning', 'pruning_finetune',
+              'pre_qat', 'qat_insert', 'qat_finetune', 'post_qat']
+
+    def __init__(self, pruning_manager: PruningManager,
+                 qat_scheduler: 'QATTrainingScheduler',
+                 mode: str = 'sequential'):
+        """
+        Args:
+            pruning_manager: 剪枝管理器实例
+            qat_scheduler: QAT调度器实例
+            mode: 训练模式 ('sequential'=先剪枝后量化, 'interleaved'=交替进行)
+        """
+        self.pruning_manager = pruning_manager
+        self.qat_scheduler = qat_scheduler
+        self.mode = mode
+        self.current_stage = 'warmup'
+        self.stage_start_epoch = 0
+
+        # 阶段配置
+        self.config = {
+            'warmup_epochs': 3,
+            'pruning_epoch': pruning_manager.config.pruning_epoch if pruning_manager.config.enabled else -1,
+            'pruning_finetune_epochs': pruning_manager.config.finetune_epochs if pruning_manager.config.enabled else 0,
+            'qat_insert_epoch': getattr(qat_scheduler.config, 'qat_insert_epoch', 3),
+            'qat_epochs': getattr(qat_scheduler.config, 'qat_epochs', 5),
+        }
+
+    def step(self, epoch: int, current_acc: float, best_acc: float) -> Dict[str, Any]:
+        """执行当前epoch的调度
+
+        Args:
+            epoch: 当前epoch
+            current_acc: 当前精度
+            best_acc: 最佳精度
+
+        Returns:
+            包含状态信息的字典
+        """
+        status = {
+            'stage': self.current_stage,
+            'pruning_applied': False,
+            'qat_inserted': False,
+            'lr_multiplier': 1.0,
+            'epoch': epoch
+        }
+
+        # 更新阶段
+        self._update_stage(epoch)
+
+        # 根据阶段执行相应操作
+        if self.current_stage == 'pruning':
+            # 执行剪枝
+            if self.pruning_manager.config.enabled:
+                applied = self.pruning_manager.apply_pruning(epoch, current_acc, best_acc)
+                status['pruning_applied'] = applied
+                if applied:
+                    print(f"[Scheduler] Epoch {epoch}: 剪枝已应用")
+
+        elif self.current_stage == 'qat_insert':
+            # 插入QAT模块
+            if self.qat_scheduler.delay_insert:
+                inserted = self.qat_scheduler.maybe_insert_qat(epoch)
+                status['qat_inserted'] = inserted
+                if inserted:
+                    print(f"[Scheduler] Epoch {epoch}: QAT模块已插入")
+
+        # 计算学习率乘数
+        status['lr_multiplier'] = self.get_lr_multiplier(epoch)
+        status['stage'] = self.current_stage
+
+        return status
+
+    def _update_stage(self, epoch: int):
+        """更新当前阶段"""
+        cfg = self.config
+
+        # 顺序模式: warmup -> pruning -> pruning_finetune -> pre_qat -> qat_insert -> qat_finetune -> post_qat
+        if epoch < cfg['warmup_epochs']:
+            new_stage = 'warmup'
+        elif not self.pruning_manager.config.enabled:
+            # 不剪枝，直接进入QAT流程
+            if epoch < cfg['qat_insert_epoch']:
+                new_stage = 'pre_qat'
+            elif epoch == cfg['qat_insert_epoch']:
+                new_stage = 'qat_insert'
+            elif epoch < cfg['qat_insert_epoch'] + cfg['qat_epochs']:
+                new_stage = 'qat_finetune'
+            else:
+                new_stage = 'post_qat'
+        elif epoch == cfg['pruning_epoch']:
+            new_stage = 'pruning'
+        elif epoch < cfg['pruning_epoch'] + cfg['pruning_finetune_epochs']:
+            new_stage = 'pruning_finetune'
+        elif epoch < cfg['qat_insert_epoch'] + cfg['pruning_finetune_epochs']:
+            new_stage = 'pre_qat'
+        elif epoch == cfg['qat_insert_epoch'] + cfg['pruning_finetune_epochs']:
+            new_stage = 'qat_insert'
+        elif epoch < cfg['qat_insert_epoch'] + cfg['pruning_finetune_epochs'] + cfg['qat_epochs']:
+            new_stage = 'qat_finetune'
+        else:
+            new_stage = 'post_qat'
+
+        if new_stage != self.current_stage:
+            print(f"[Scheduler] 阶段切换: {self.current_stage} -> {new_stage} (Epoch {epoch})")
+            self.current_stage = new_stage
+            self.stage_start_epoch = epoch
+
+    def get_lr_multiplier(self, epoch: int) -> float:
+        """获取当前阶段的学习率乘数"""
+        multipliers = {
+            'warmup': 1.0,
+            'pre_pruning': 1.0,
+            'pruning': 0.5,  # 剪枝时降低学习率
+            'pruning_finetune': 0.1,  # 剪枝后微调使用低学习率
+            'pre_qat': 1.0,
+            'qat_insert': 0.5,  # QAT插入时降低学习率
+            'qat_finetune': getattr(self.qat_scheduler.config, 'qat_learning_rate_multiplier', 0.1),
+            'post_qat': 0.05,
+        }
+        return multipliers.get(self.current_stage, 1.0)
+
+    def should_freeze_bn_ln(self, epoch: int) -> bool:
+        """检查是否应该冻结BN/LN层"""
+        # 在QAT微调阶段冻结
+        return self.current_stage in ['qat_finetune', 'post_qat']
+
+    def get_current_stage(self) -> str:
+        """获取当前阶段"""
+        return self.current_stage
+
+    def is_pruning_time(self, epoch: int) -> bool:
+        """检查是否是剪枝时机"""
+        return self.current_stage == 'pruning' and epoch == self.config['pruning_epoch']
+
+    def is_qat_time(self, epoch: int) -> bool:
+        """检查是否是QAT插入时机"""
+        return self.current_stage == 'qat_insert'
+
+    def get_progress_summary(self) -> Dict[str, Any]:
+        """获取训练进度摘要"""
+        return {
+            'current_stage': self.current_stage,
+            'stages_completed': self.STAGES.index(self.current_stage) if self.current_stage in self.STAGES else 0,
+            'total_stages': len(self.STAGES),
+            'pruning_applied': self.pruning_manager.pruning_applied,
+            'qat_inserted': self.qat_scheduler.qat_inserted if hasattr(self.qat_scheduler, 'qat_inserted') else False,
+            'lr_multiplier': self.get_lr_multiplier(0),  # 当前阶段的学习率乘数
+        }
 
 
 class QATTrainingScheduler:
@@ -454,10 +2033,6 @@ class QATTrainingScheduler:
     3. QAT微调阶段: 低学习率微调量化参数，冻结BN/LN
     4. 后QAT阶段: 更低学习率继续微调
 
-    修复改进:
-    - 支持延迟QAT插入（不在初始化时立即插入）
-    - 完善的归一化层冻结支持
-    - 正确的学习率乘数计算
     """
 
     def __init__(self, config: Dict, quantization_manager: 'QuantizationManager',
@@ -1798,8 +3373,8 @@ class QuantizationManager:
         self.quantizer = None
         self.calibration_data = []
         self.original_model = None
-        self.qat_config = None  # 存储QAT配置
-        self.use_modern_api = False  # 是否使用新版QAT API
+        self.qat_config = None
+        self.use_modern_api = False
 
     def prepare_model_for_quantization(self) -> torch.nn.Module:
         """准备模型进行量化
@@ -1867,20 +3442,16 @@ class QuantizationManager:
 
             print(f"   使用 group_size={group_size} (最小in_features={min_in_features})")
 
-        # 使用新的 IntxFakeQuantizeConfig API (注意是小写x)
         # 激活量化配置 - PerToken动态量化
-        if activation_bits == 8:
-            activation_config = IntxFakeQuantizeConfig(
-                dtype=torch.int8,
-                granularity="per_token",
-                is_symmetric=False,
-            )
-        else:
-            activation_config = IntxFakeQuantizeConfig(
-                dtype=torch.int8,
-                granularity="per_token",
-                is_symmetric=False,
-            )
+        # 根据 activation_bits 选择配置，目前仅支持 INT8 激活
+        # 注意: torchao 0.16.0 目前仅支持 INT8 激活量化
+        if activation_bits not in [8, 16]:
+            print(f"   警告: activation_bits={activation_bits} 不支持，使用 INT8")
+        activation_config = IntxFakeQuantizeConfig(
+            dtype=torch.int8,
+            granularity="per_token",
+            is_symmetric=False,
+        )
 
         # 权重量化配置
         if weight_bits == 4:
@@ -2037,39 +3608,55 @@ class QuantizationManager:
             dtype=torch.int8, granularity="per_channel", is_symmetric=True
         )
 
-        # 构建FQN到配置的映射
-        fqn_to_config = {}
+        # 使用 quantize_ 逐个模块应用分层配置
+        # 注意: ComposableQATQuantizer 需要 List[TwoStepQuantizer]，不适用于此场景
+        print("   开始为各层应用量化配置...")
+        
+        # 统计应用情况
+        applied_counts = {'backbone': 0, 'neck': 0, 'decoder': 0}
+        
         for name, module in self.model.named_modules():
-            if isinstance(module, (nn.Linear, nn.Conv2d)):
-                if 'backbone' in name:
-                    fqn_to_config[name] = QATConfig(
-                        activation_config=backbone_act_config,
-                        weight_config=backbone_weight_config,
-                        step="prepare"
-                    )
-                elif 'neck' in name:
-                    fqn_to_config[name] = QATConfig(
-                        activation_config=neck_act_config,
-                        weight_config=neck_weight_config,
-                        step="prepare"
-                    )
-                elif 'decoder' in name or 'ctc' in name or 'ar' in name:
-                    fqn_to_config[name] = QATConfig(
-                        activation_config=decoder_act_config,
-                        weight_config=decoder_weight_config,
-                        step="prepare"
-                    )
-
-        # 使用ComposableQATQuantizer应用分层配置
-        quantizer = ComposableQATQuantizer(fqn_to_config)
-        prepared_model = quantizer.prepare(self.model)
-
+            if not isinstance(module, (nn.Linear, nn.Conv2d)):
+                continue
+            
+            config = None
+            layer_type = None
+            
+            if 'backbone' in name:
+                config = QATConfig(
+                    activation_config=backbone_act_config,
+                    weight_config=backbone_weight_config,
+                    step="prepare"
+                )
+                layer_type = 'backbone'
+            elif 'neck' in name:
+                config = QATConfig(
+                    activation_config=neck_act_config,
+                    weight_config=neck_weight_config,
+                    step="prepare"
+                )
+                layer_type = 'neck'
+            elif 'decoder' in name or 'ctc' in name or 'ar' in name:
+                config = QATConfig(
+                    activation_config=decoder_act_config,
+                    weight_config=decoder_weight_config,
+                    step="prepare"
+                )
+                layer_type = 'decoder'
+            
+            if config is not None:
+                try:
+                    quantize_(module, config)
+                    applied_counts[layer_type] += 1
+                except Exception as e:
+                    print(f"   ⚠️  {name} 应用量化配置失败: {e}")
+        
         print(f"✅ 分层混合精度QAT应用完成")
-        print(f"   - Backbone层: INT8动态激活 + INT4权重 (groupsize=256)")
-        print(f"   - Neck层: INT8动态激活 + INT4权重 (groupsize=128)")
-        print(f"   - Decoder层: INT8动态激活 + INT8权重")
+        print(f"   - Backbone层: {applied_counts['backbone']} 个模块 (INT8动态激活 + INT4权重)")
+        print(f"   - Neck层: {applied_counts['neck']} 个模块 (INT8动态激活 + INT4权重)")
+        print(f"   - Decoder层: {applied_counts['decoder']} 个模块 (INT8动态激活 + INT8权重)")
 
-        return prepared_model
+        return self.model
 
     def _apply_ptq_quantization(self) -> torch.nn.Module:
         """应用训练后量化 - 使用新版API (torchao 0.16.0)

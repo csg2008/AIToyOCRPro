@@ -575,7 +575,7 @@ class ONNXExporter(ModelExporter):
                 for name, submodule in submodules.items():
                     if submodule is not None:
                         try:
-                            quantize_(submodule, quantizer())
+                            quantize_(submodule, quantizer)
                             logger.info(f"  ✅ {name} 量化完成")
                         except Exception as sub_err:
                             logger.warning(f"  ⚠️ {name} 量化失败: {sub_err}")
@@ -592,7 +592,7 @@ class ONNXExporter(ModelExporter):
                 model_copy.eval()
                 
                 # 应用真量化
-                quantize_(model_copy, quantizer())
+                quantize_(model_copy, quantizer)
                 model_to_return = model_copy
             
             logger.info("✅ 旧版QAT模型已成功转换为真量化模型")

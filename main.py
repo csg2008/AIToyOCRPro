@@ -134,7 +134,7 @@ def parse_args():
     parser.add_argument('--enable_pruning', action='store_true', default=False,
                        help='启用模型剪枝')
     parser.add_argument('--pruning_strategy', type=str,
-                       choices=['l1_unstructured', 'l1_structured', 'ln_structured'],
+                       choices=['l1_unstructured', 'l1_structured', 'l2_structured', 'ln_structured', 'global_unstructured'],
                        default='l1_unstructured', help='剪枝策略')
     parser.add_argument('--pruning_ratio', type=float, default=0.3,
                        help='全局剪枝比例')
@@ -156,6 +156,16 @@ def parse_args():
                        help='Neck剪枝比例')
     parser.add_argument('--decoder_pruning_ratio', type=float, default=0.1,
                        help='Decoder剪枝比例')
+    
+    # 高级剪枝配置
+    parser.add_argument('--apply_pruning_during_training', action='store_true', default=False,
+                       help='训练期间实际应用剪枝(否则仅在部署时应用)')
+    parser.add_argument('--validate_pruning', action='store_true', default=False,
+                       help='剪枝后验证精度，如下降过大则回滚')
+    parser.add_argument('--visualize_pruning', action='store_true', default=False,
+                       help='生成剪枝可视化图表')
+    parser.add_argument('--structural_compression', action='store_true', default=False,
+                       help='部署时执行结构化压缩(真正删除通道)')
 
     # 高级配置
     parser.add_argument('--deployment_target', type=str, default='server_cpu',
@@ -622,13 +632,65 @@ def train_quantized_main(args, quantization_manager: QuantizationManager, quanti
                 print('🎉  Val_EM 达到 99.2 %，训练提前完成')
                 break
 
-            # 检查是否需要记录剪枝候选节点
+            # 检查是否需要执行剪枝
             if pruning_manager.is_pruning_time(epoch):
-                # 记录剪枝候选节点（部署时应用）
-                pruning_manager.record_pruning_candidates(epoch, val_em, best_em)
+                print(f"\n{'='*60}")
+                print(f"🌳 执行模型剪枝 (Epoch {epoch})")
+                print(f"{'='*60}")
+                
+                # 方案1: 训练期间应用剪枝
+                if getattr(args, 'apply_pruning_during_training', False):
+                    # 根据策略选择剪枝方法
+                    if args.pruning_strategy == 'global_unstructured':
+                        pruning_applied = pruning_manager.apply_global_pruning(
+                            epoch, val_em, best_em
+                        )
+                    else:
+                        pruning_applied = pruning_manager.apply_pruning(
+                            epoch, val_em, best_em
+                        )
+                    
+                    if pruning_applied:
+                        print(f"✅ 剪枝已应用")
+                        
+                        # 验证剪枝效果（如果启用）
+                        if getattr(args, 'validate_pruning', False):
+                            print("🔍 验证剪枝效果...")
+                            is_valid = pruning_manager.validate_pruning_with_rollback(
+                                val_loader, 
+                                max_acc_drop=args.min_acc_drop
+                            )
+                            if not is_valid:
+                                print("⚠️ 剪枝导致精度下降过大，已自动回滚")
+                            else:
+                                print("✅ 剪枝验证通过")
+                        
+                        # 生成可视化（如果启用）
+                        if getattr(args, 'visualize_pruning', False):
+                            vis_path = f'{output_dir}/visualizations/pruning_epoch_{epoch}.png'
+                            os.makedirs(os.path.dirname(vis_path), exist_ok=True)
+                            pruning_manager.visualize_pruning(vis_path)
+                        
+                        # 打印剪枝统计
+                        ratio = pruning_manager.calculate_pruning_ratio()
+                        struct_ratio, pruned_ch, total_ch = pruning_manager.calculate_structured_pruning_ratio()
+                        print(f"📊 剪枝统计:")
+                        print(f"   - 参数剪枝比例: {ratio:.2%}")
+                        print(f"   - 结构化剪枝: {pruned_ch}/{total_ch} channels ({struct_ratio:.2%})")
+                    else:
+                        print("⚠️ 剪枝未应用（可能因精度不达标）")
+                
+                # 方案2: 仅记录候选节点（部署时应用）
+                else:
+                    pruning_manager.record_pruning_candidates(epoch, val_em, best_em)
+                    print("✅ 剪枝候选节点已记录（将在部署时应用）")
+                
+                print(f"{'='*60}\n")
 
     except Exception as e:
         print(f'❌ 训练过程中出现异常: {e}')
+        import traceback
+        traceback.print_exc()
         success = False
 
     print('\n训练结束（可能提前停止）')
@@ -637,6 +699,14 @@ def train_quantized_main(args, quantization_manager: QuantizationManager, quanti
     if pruning_manager.pruning_candidates:
         candidates_path = f'{output_dir}/models/pruning_candidates.json'
         pruning_manager.save_pruning_candidates(candidates_path)
+        
+    # 保存剪枝可视化（如果有且未在训练期间生成）
+    if (getattr(args, 'visualize_pruning', False) and 
+        pruning_manager.pruning_applied and 
+        not getattr(args, 'apply_pruning_during_training', False)):
+        vis_path = f'{output_dir}/visualizations/pruning_final.png'
+        os.makedirs(os.path.dirname(vis_path), exist_ok=True)
+        pruning_manager.visualize_pruning(vis_path)
 
     return model, success
 
@@ -1047,26 +1117,83 @@ def main():
     # 创建部署
     if success and args.mode in ['deployment', 'both']:
         if args.enable_pruning:
-            # 检查是否有剪枝候选信息文件
-            candidates_path = f'{output_dir}/models/pruning_candidates.json'
-            if os.path.exists(candidates_path):
-                # 加载剪枝候选信息
-                pruning_manager.load_pruning_candidates(candidates_path)
-
-                # 应用剪枝
-                pruning_manager.apply_pruning_from_candidates()
-                pruning_manager.remove_pruning()
-
+            print(f"\n{'='*60}")
+            print("🌳 部署阶段剪枝处理")
+            print(f"{'='*60}")
+            
+            # 检查是否已经应用了剪枝（训练期间应用）
+            if not pruning_manager.pruning_applied:
+                # 检查是否有剪枝候选信息文件
+                candidates_path = f'{output_dir}/models/pruning_candidates.json'
+                if os.path.exists(candidates_path):
+                    print(f"📄 加载剪枝候选信息: {candidates_path}")
+                    pruning_manager.load_pruning_candidates(candidates_path)
+                    
+                    # 应用剪枝
+                    pruning_manager.apply_pruning_from_candidates()
+                else:
+                    print(f"⚠️  未找到剪枝候选信息文件，尝试直接应用剪枝...")
+                    # 直接应用剪枝（如果配置了剪枝比例）
+                    if args.pruning_strategy == 'global_unstructured':
+                        pruning_manager.apply_global_pruning(
+                            args.pruning_epoch, current_acc=1.0, best_acc=1.0
+                        )
+                    else:
+                        pruning_manager.apply_pruning(
+                            args.pruning_epoch, current_acc=1.0, best_acc=1.0
+                        )
+            
+            # 使剪枝永久化
+            if pruning_manager.pruning_applied:
+                print("🔧 使剪枝永久化...")
+                pruning_manager.make_pruning_permanent()
+                
+                # 结构化压缩（如果启用）
+                if getattr(args, 'structural_compression', False):
+                    print("🔧 执行结构化压缩...")
+                    print("   注意: 这将真正删除被剪枝的通道，减少模型大小")
+                    
+                    # 创建验证加载器用于验证压缩效果
+                    val_loader = create_dataset(
+                        dataset_type=args.dataset_type,
+                        data_dir=args.lmdb_data_dir,
+                        num_samples=min(1000, args.num_val),
+                        img_height=args.img_height,
+                        min_width=args.img_min_width,
+                        min_chars=args.min_chars,
+                        max_chars=args.max_chars,
+                        key_img_prefix=args.key_img_prefix,
+                        key_label_prefix=args.key_label_prefix,
+                    )
+                    
+                    pruning_manager.compress_model_structurally(
+                        val_dataloader=val_loader,
+                        max_acc_drop=args.min_acc_drop
+                    )
+                
                 # 打印剪枝信息
-                if pruning_manager.pruning_applied:
-                    prune_info = pruning_manager.get_pruned_model_info()
-                    print(f"\n🌳 剪枝总结:")
-                    print(f"   - 剪枝应用: {'是' if prune_info['pruning_applied'] else '否'}")
-                    print(f"   - 剪枝层数量: {prune_info['pruned_layers_count']}")
-                    print(f"   - 实际剪枝比例: {prune_info['pruning_ratio']:.2%}")
-                    print(f"   - 剪枝层: {prune_info['pruned_layers'][:5]}..." if len(prune_info['pruned_layers']) > 5 else f"   - 剪枝层: {prune_info['pruned_layers']}")
+                prune_info = pruning_manager.get_pruned_model_info()
+                stats = pruning_manager.get_detailed_pruning_stats()
+                struct_ratio, pruned_ch, total_ch = pruning_manager.calculate_structured_pruning_ratio()
+                
+                print(f"\n📊 剪枝总结:")
+                print(f"   - 剪枝应用: {'是' if prune_info['pruning_applied'] else '否'}")
+                print(f"   - 剪枝层数量: {prune_info['pruned_layers_count']}")
+                print(f"   - 参数剪枝比例: {stats['global_ratio']:.2%}")
+                print(f"   - 结构化剪枝: {pruned_ch}/{total_ch} channels ({struct_ratio:.2%})")
+                print(f"   - 总参数量: {stats['total_params']:,}")
+                print(f"   - 剪枝参数量: {stats['pruned_params']:,}")
+                
+                # 生成可视化
+                if getattr(args, 'visualize_pruning', False):
+                    vis_path = f'{output_dir}/visualizations/pruning_deployment.png'
+                    os.makedirs(os.path.dirname(vis_path), exist_ok=True)
+                    pruning_manager.visualize_pruning(vis_path)
+                    print(f"   - 可视化图表: {vis_path}")
             else:
-                print(f"⚠️  未找到剪枝候选信息文件: {candidates_path}")
+                print("⚠️  剪枝未应用")
+            
+            print(f"{'='*60}\n")
 
         dummy_input = torch.randn(3, 3, args.img_height, args.img_export_width)
         create_deployment_package(quantized_model, quantization_config, args.deployment_target, output_dir, dummy_input,
