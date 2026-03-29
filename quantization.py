@@ -28,6 +28,7 @@ import itertools
 import warnings
 import copy
 import random
+import traceback
 from torchao.quantization import (
     quantize_,
     Int8DynamicActivationIntxWeightConfig,
@@ -150,7 +151,7 @@ class PruningManager:
 
     def _clear_all_pruning_masks(self):
         """清除模型中所有残留的剪枝 mask
-        
+
         改进: 使用 prune.remove() 和 prune.is_pruned() 标准API，
         避免直接操作属性导致的状态不一致
         """
@@ -159,14 +160,14 @@ class PruningManager:
             # 使用标准API检查是否已剪枝，而不是检查属性
             if not prune.is_pruned(module):
                 continue
-                
+
             for param_name in ['weight', 'bias']:
                 mask_attr = f'{param_name}_mask'
-                
+
                 # 只有当mask属性存在时才处理
                 if not hasattr(module, mask_attr):
                     continue
-                    
+
                 try:
                     # 使用标准API移除剪枝，这会正确处理原始参数
                     prune.remove(module, param_name)
@@ -182,7 +183,7 @@ class PruningManager:
                                 param.data = param.data * mask
                     except Exception:
                         pass
-        
+
         # 清理pruned_layers列表中的记录
         self.pruned_layers = []
         self.pruning_applied = False
@@ -1181,8 +1182,6 @@ class PruningManager:
         Args:
             save_path: 保存路径
         """
-        import matplotlib.pyplot as plt
-
         stats = self.get_detailed_pruning_stats()
 
         fig, axes = plt.subplots(2, 2, figsize=(14, 10))
@@ -1484,7 +1483,6 @@ class PruningManager:
 
         except Exception as e:
             print(f"   调整BN层失败 {bn_name}: {e}")
-            import traceback
             traceback.print_exc()
 
     def get_layer_connectivity(self) -> Dict[str, List[str]]:
@@ -1707,7 +1705,6 @@ class PruningManager:
 
             except Exception as e:
                 print(f"   压缩层 {name} 失败: {e}")
-                import traceback
                 traceback.print_exc()
                 continue
 
@@ -2076,7 +2073,6 @@ class QATTrainingScheduler:
 
                 # 验证QAT是否成功应用
                 has_fake_quant = False
-                from torchao.quantization.qat.linear import FakeQuantizedLinear
                 for name, module in self.model.named_modules():
                     if isinstance(module, FakeQuantizedLinear):
                         has_fake_quant = True
@@ -3611,17 +3607,17 @@ class QuantizationManager:
         # 使用 quantize_ 逐个模块应用分层配置
         # 注意: ComposableQATQuantizer 需要 List[TwoStepQuantizer]，不适用于此场景
         print("   开始为各层应用量化配置...")
-        
+
         # 统计应用情况
         applied_counts = {'backbone': 0, 'neck': 0, 'decoder': 0}
-        
+
         for name, module in self.model.named_modules():
             if not isinstance(module, (nn.Linear, nn.Conv2d)):
                 continue
-            
+
             config = None
             layer_type = None
-            
+
             if 'backbone' in name:
                 config = QATConfig(
                     activation_config=backbone_act_config,
@@ -3643,14 +3639,14 @@ class QuantizationManager:
                     step="prepare"
                 )
                 layer_type = 'decoder'
-            
+
             if config is not None:
                 try:
                     quantize_(module, config)
                     applied_counts[layer_type] += 1
                 except Exception as e:
                     print(f"   ⚠️  {name} 应用量化配置失败: {e}")
-        
+
         print(f"✅ 分层混合精度QAT应用完成")
         print(f"   - Backbone层: {applied_counts['backbone']} 个模块 (INT8动态激活 + INT4权重)")
         print(f"   - Neck层: {applied_counts['neck']} 个模块 (INT8动态激活 + INT4权重)")
@@ -3689,7 +3685,6 @@ class QuantizationManager:
             )
         elif strategy == 'int8_weight_only':
             # torchao 0.16.0: IntxWeightOnlyConfig 使用 PerAxis(axis=0) 进行通道级量化
-            from torchao.quantization.granularity import PerAxis
             quantizer = IntxWeightOnlyConfig(
                 weight_dtype=torch.int8,
                 granularity=PerAxis(axis=0),
@@ -3942,10 +3937,11 @@ class QuantizationManager:
             # 使用torch.export导出量化模型
             try:
                 # 确保example_input在正确的设备上
-                example_input = example_input.to(next(export_model.parameters()).device)
+                # example_input = example_input.to(next(export_model.parameters()).device)
 
-                exported_program = export(export_model, (example_input,))
-                state['quantization_model'] = exported_program
+                # 保存量化的模型会导致加载时提示：TypeError: _ModuleStackTracer.init() missing 1 required positional argument: 'scope_root'
+                # exported_program = export(export_model, (example_input,))
+                # state['quantization_model'] = exported_program
 
                 # 同时保存onnx格式的元数据
                 state['export_metadata'] = {
